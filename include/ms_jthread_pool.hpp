@@ -1,310 +1,214 @@
 #pragma once
-/*
- * ms_jthread_pool.hpp
- * Header-only jthread-based thread pool using a Michael–Scott MPMC queue.
- * - C++20
- * - No external deps
- * - Memory-safe via a tiny hazard-pointer reclaimer (2 hazard slots / thread)
- *
- * Build: g++ -std=c++20 -O2 -pthread your.cpp
- */
-
 #include <atomic>
 #include <cassert>
-#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <future>
-#include <limits>
 #include <memory>
-#include <optional>
-#include <semaphore>
+#include <mutex>
+#include <condition_variable>
+#include <stop_token>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-namespace msjp {
+namespace ms {
 
-namespace detail {
+// ---------- minimal hazard pointers (just enough for MS queue head) ----------
+struct hazard_domain {
+  static constexpr std::size_t max_slots = 1024;
+  std::atomic<void*> slots[max_slots]{}; // cleared to nullptr
+  std::atomic<unsigned> next{0};
 
-// -------- Hazard-pointer reclaimer (minimal) -------------------------------
-// Two hazard slots per thread; N global records. Epochless scan-based reclaim.
-template <std::size_t MaxThreads = 128, std::size_t SlotsPerThread = 2>
-struct HazardDomain {
-  struct Record {
-    std::atomic<void*> slot[SlotsPerThread];
-    Record() {
-      for (auto& s : slot) s.store(nullptr, std::memory_order_relaxed);
-    }
-  };
-
-  // Global table of hazard records
-  static Record* records() {
-    static Record arr[MaxThreads];
-    return arr;
+  unsigned acquire_slot() {
+    unsigned id = next.fetch_add(1, std::memory_order_relaxed);
+    if (id >= max_slots) throw std::runtime_error("hazard_domain: out of slots");
+    return id;
   }
-
-  // Thread-local reservation of one record
-  static Record* my_record() {
-    thread_local Record* rec = [] {
-      // Naive first-free reservation
-      auto recs = records();
-      for (std::size_t i = 0; i < MaxThreads; ++i) {
-        // "Claim" a record by leaving it as-is (we'll just start using it).
-        // If many threads > MaxThreads, behavior degrades (documented).
-        // In practice set MaxThreads >= max worker + producer threads.
-        bool all_null = true;
-        for (auto& s : recs[i].slot) {
-          if (s.load(std::memory_order_relaxed) != nullptr) { all_null = false; break; }
-        }
-        if (all_null) {
-          return &recs[i];
-        }
-      }
-      // Fallback: last slot (still safe; just shared).
-      return &recs[MaxThreads - 1];
-    }();
-    return rec;
-  }
-
-  static void set_hazard(std::size_t idx, void* p) {
-    my_record()->slot[idx].store(p, std::memory_order_seq_cst);
-  }
-  static void clear_hazard(std::size_t idx) {
-    my_record()->slot[idx].store(nullptr, std::memory_order_release);
-  }
-
-  // Snapshot all hazard pointers (for reclamation pass)
-  static void snapshot_hazards(std::vector<void*>& out) {
-    auto recs = records();
-    for (std::size_t i = 0; i < MaxThreads; ++i) {
-      for (std::size_t j = 0; j < SlotsPerThread; ++j) {
-        if (void* p = recs[i].slot[j].load(std::memory_order_seq_cst)) {
-          out.push_back(p);
-        }
-      }
-    }
+  bool any_holds(void* p) const noexcept {
+    for (std::size_t i = 0; i < max_slots; ++i)
+      if (slots[i].load(std::memory_order_acquire) == p) return true;
+    return false;
   }
 };
+inline hazard_domain& global_hazard_domain() {
+  static hazard_domain hd;
+  return hd;
+}
 
-// -------- Michael–Scott MPMC queue with hazard reclamation -----------------
-template <typename T,
-          std::size_t MaxThreads = 128,
-          std::size_t ReclaimBatch = 64>
-class MSQueue {
-  // Two hazard slots needed: [0] protects head/tail we dereference, [1] protects 'next'
-  using HD = HazardDomain<MaxThreads, 2>;
-
-  struct Node {
-    std::atomic<Node*> next{nullptr};
-    std::optional<T> payload;  // empty in the dummy node
-    Node() = default;                      // dummy
-    explicit Node(T&& v) : payload(std::move(v)) {}
-    explicit Node(const T& v) : payload(v) {}
+// --------------------------- Michael–Scott MPMC queue ------------------------
+template <class T>
+class ms_queue {
+  struct node {
+    std::atomic<node*> next{nullptr};
+    T value; // dummy head has default-constructed T
+    node() = default;
+    explicit node(T v) : value(std::move(v)) {}
   };
 
-  std::atomic<Node*> head_{nullptr};
-  std::atomic<Node*> tail_{nullptr};
+  std::atomic<node*> head_{nullptr};
+  std::atomic<node*> tail_{nullptr};
 
-  // per-thread retired list
-  static thread_local std::vector<Node*> retired_;
+  static thread_local std::vector<node*> retired_;
+  static constexpr std::size_t retire_scan_threshold_ = 64;
 
-  static void retire(Node* n) {
-    retired_.push_back(n);
-    if (retired_.size() >= ReclaimBatch) {
-      // Collect current hazards and reclaim unhazarded retired nodes
-      std::vector<void*> hazards;
-      hazards.reserve(MaxThreads * 2);
-      HD::snapshot_hazards(hazards);
-
-      auto keep = std::vector<Node*>{};
-      keep.reserve(retired_.size());
-      for (Node* p : retired_) {
-        bool is_hazard = false;
-        for (void* h : hazards) {
-          if (h == p) { is_hazard = true; break; }
-        }
-        if (is_hazard) keep.push_back(p);
-        else delete p;
+  unsigned hazard_slot_() const {
+    static thread_local unsigned slot = global_hazard_domain().acquire_slot();
+    return slot;
+  }
+  void protect_(node* p) const noexcept {
+    global_hazard_domain().slots[hazard_slot_()].store(p, std::memory_order_release);
+  }
+  void clear_hazard_() const noexcept {
+    global_hazard_domain().slots[hazard_slot_()].store(nullptr, std::memory_order_release);
+  }
+  void retire_or_delete_(node* old) {
+    auto& hd = global_hazard_domain();
+    if (!hd.any_holds(old)) { delete old; return; }
+    retired_.push_back(old);
+    if (retired_.size() >= retire_scan_threshold_) {
+      auto it = retired_.begin();
+      while (it != retired_.end()) {
+        if (!hd.any_holds(*it)) { delete *it; it = retired_.erase(it); }
+        else { ++it; }
       }
-      retired_.swap(keep);
     }
   }
 
 public:
-  MSQueue() {
-    // Initialize with a dummy node
-    Node* dummy = new Node();
+  ms_queue() {
+    node* dummy = new node();
     head_.store(dummy, std::memory_order_relaxed);
     tail_.store(dummy, std::memory_order_relaxed);
   }
-
-  ~MSQueue() {
-    // Drain & reclaim all nodes
-    T tmp;
-    while (try_dequeue(tmp)) {}
-    Node* dummy = head_.load(std::memory_order_relaxed);
-    if (dummy) delete dummy;  // leftover dummy
-    // Reclaim any retired still pending (single-threaded by now)
-    for (Node* p : retired_) delete p;
-    retired_.clear();
+  ~ms_queue() {
+    node* n = head_.load(std::memory_order_relaxed);
+    while (n) { node* next = n->next.load(std::memory_order_relaxed); delete n; n = next; }
   }
+  ms_queue(const ms_queue&) = delete;
+  ms_queue& operator=(const ms_queue&) = delete;
 
-  // Non-copyable/movable (holds atomics and raw nodes)
-  MSQueue(const MSQueue&) = delete;
-  MSQueue& operator=(const MSQueue&) = delete;
-
-  template <typename U>
-  void enqueue(U&& value) {
-    Node* node = new Node(std::forward<U>(value));
-    node->next.store(nullptr, std::memory_order_relaxed);
-
+  void enqueue(T v) {
+    node* n = new node(std::move(v));
     for (;;) {
-      Node* tail = tail_.load(std::memory_order_acquire);
-      HD::set_hazard(0, tail);
-      if (tail != tail_.load(std::memory_order_acquire)) { continue; }
-
-      Node* next = tail->next.load(std::memory_order_acquire);
-      HD::set_hazard(1, next);
-      if (tail != tail_.load(std::memory_order_acquire)) { 
-        HD::clear_hazard(1); HD::clear_hazard(0); 
-        continue; 
-      }
-
-      if (next == nullptr) {
-        if (tail->next.compare_exchange_weak(next, node,
-                std::memory_order_release, std::memory_order_relaxed)) {
-          // enqueued; try to swing tail forward
-          tail_.compare_exchange_strong(tail, node,
-                std::memory_order_release, std::memory_order_relaxed);
-          HD::clear_hazard(1); HD::clear_hazard(0);
-          return;
+      node* t = tail_.load(std::memory_order_acquire);
+      node* next = t->next.load(std::memory_order_acquire);
+      if (t == tail_.load(std::memory_order_acquire)) {
+        if (next == nullptr) {
+          if (t->next.compare_exchange_weak(next, n, std::memory_order_release, std::memory_order_acquire)) {
+            tail_.compare_exchange_strong(t, n, std::memory_order_release, std::memory_order_acquire);
+            return;
+          }
+        } else {
+          tail_.compare_exchange_strong(t, next, std::memory_order_release, std::memory_order_acquire);
         }
-      } else {
-        // Help advance tail
-        tail_.compare_exchange_weak(tail, next,
-              std::memory_order_release, std::memory_order_relaxed);
       }
-      HD::clear_hazard(1); HD::clear_hazard(0);
     }
   }
 
   bool try_dequeue(T& out) {
     for (;;) {
-      Node* head = head_.load(std::memory_order_acquire);
-      HD::set_hazard(0, head);
-      if (head != head_.load(std::memory_order_acquire)) { continue; }
-
-      Node* tail = tail_.load(std::memory_order_acquire);
-      Node* next = head->next.load(std::memory_order_acquire);
-      HD::set_hazard(1, next);
-      if (head != head_.load(std::memory_order_acquire)) { 
-        HD::clear_hazard(1); 
-        continue; 
+      node* h = head_.load(std::memory_order_acquire);
+      protect_(h);
+      if (h != head_.load(std::memory_order_acquire)) continue;
+      node* t = tail_.load(std::memory_order_acquire);
+      node* next = h->next.load(std::memory_order_acquire);
+      if (h == head_.load(std::memory_order_acquire)) {
+        if (h == t) {
+          if (next == nullptr) { clear_hazard_(); return false; }
+          tail_.compare_exchange_strong(t, next, std::memory_order_release, std::memory_order_acquire);
+        } else {
+          out = std::move(next->value);
+          if (head_.compare_exchange_strong(h, next, std::memory_order_release, std::memory_order_acquire)) {
+            clear_hazard_();
+            retire_or_delete_(h);
+            return true;
+          }
+        }
       }
-
-      if (next == nullptr) {
-        // queue empty
-        HD::clear_hazard(1); HD::clear_hazard(0);
-        return false;
-      }
-
-      if (head == tail) {
-        // Tail is falling behind; help it
-        tail_.compare_exchange_weak(tail, next,
-              std::memory_order_release, std::memory_order_relaxed);
-        HD::clear_hazard(1); // keep looping
-        continue;
-      }
-
-      // Read value before swinging head
-      T value = std::move(*next->payload);
-      if (head_.compare_exchange_weak(head, next,
-              std::memory_order_release, std::memory_order_relaxed)) {
-        HD::clear_hazard(1); HD::clear_hazard(0);
-        out = std::move(value);
-        retire(head);                // old dummy becomes retiree
-        return true;
-      }
-      HD::clear_hazard(1); // try again
     }
+  }
+
+  bool empty() const {
+    node* h = head_.load(std::memory_order_acquire);
+    return h->next.load(std::memory_order_acquire) == nullptr;
   }
 };
+template <class T>
+thread_local std::vector<typename ms_queue<T>::node*> ms_queue<T>::retired_{};
 
-template <typename T, std::size_t M, std::size_t R>
-thread_local std::vector<typename MSQueue<T, M, R>::Node*>
-MSQueue<T, M, R>::retired_;
-
-// -------- Thread pool (jthread + counting_semaphore + MSQueue) -------------
-class JThreadPool {
+// --------------------------------- thread pool --------------------------------
+class jthread_pool {
 public:
-  explicit JThreadPool(std::size_t workers =
-                         std::max(1u, std::thread::hardware_concurrency()))
-      : sem_(0) {
-    workers_.reserve(workers);
-    for (std::size_t i = 0; i < workers; ++i) {
-      workers_.emplace_back([this](std::stop_token st){ worker_loop(st); });
+  using task_type = std::function<void()>; // needs to be copyable for std::function
+
+  explicit jthread_pool(std::size_t threads = std::thread::hardware_concurrency()) {
+    if (threads == 0) threads = 1;
+    workers_.reserve(threads);
+    for (std::size_t i = 0; i < threads; ++i) {
+      workers_.emplace_back([this](std::stop_token st){ worker_loop_(st); });
     }
   }
 
-  ~JThreadPool() {
-    // Request stop, wake all workers.
-    for (auto& jt : workers_) jt.request_stop();
-    sem_.release(static_cast<int>(workers_.size()));
-    // jthread joins on destruction automatically.
+  ~jthread_pool() {
+    request_stop();
+    cv_.notify_all(); // wake sleepers so they observe stop
+    // std::jthread dtor joins (and requests stop) automatically
   }
 
-  JThreadPool(const JThreadPool&) = delete;
-  JThreadPool& operator=(const JThreadPool&) = delete;
+  jthread_pool(const jthread_pool&) = delete;
+  jthread_pool& operator=(const jthread_pool&) = delete;
 
-  template <typename F, typename... Args>
-  auto submit(F&& f, Args&&... args)
-      -> std::future<std::invoke_result_t<F, Args...>> {
+  void request_stop() noexcept { stop_.store(true, std::memory_order_release); }
+
+  template <class F, class... Args>
+  auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
     using R = std::invoke_result_t<F, Args...>;
 
-    std::packaged_task<R()> task(
-      std::bind(std::forward<F>(f), std::forward<Args>(args)...)
-    );
-    std::future<R> fut = task.get_future();
+    if (stop_.load(std::memory_order_acquire)) throw std::runtime_error("jthread_pool stopped");
 
-    queue_.enqueue([t = std::move(task)]() mutable { t(); });
-    sem_.release(1);
+    // Bind to nullary and wrap in shared_ptr so the task is copyable for std::function
+    auto bound = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
+    auto sp_task = std::make_shared<std::packaged_task<R()>>(std::move(bound));
+    std::future<R> fut = sp_task->get_future();
+
+    task_type t = [sp_task]() mutable { (*sp_task)(); }; // copies shared_ptr
+    q_.enqueue(std::move(t));
+
+    { std::scoped_lock lk(m_); ++pending_; }
+    cv_.notify_one();
     return fut;
   }
 
-  std::size_t thread_count() const noexcept { return workers_.size(); }
+  std::size_t size() const noexcept { return workers_.size(); }
 
 private:
-  using Task = std::function<void()>;
-
-  void worker_loop(std::stop_token st) {
-    // Drain-on-stop semantics: when stop requested, finish remaining tasks.
+  void worker_loop_(std::stop_token st) {
     for (;;) {
-      sem_.acquire(); // wake for (maybe) one task or stop signal
-      if (st.stop_requested()) {
-        // Drain tasks and exit
-        Task t;
-        while (queue_.try_dequeue(t)) {
-          t();
-        }
+      task_type task;
+      while (q_.try_dequeue(task)) {
+        { std::scoped_lock lk(m_); if (pending_ > 0) --pending_; }
+        task();
+      }
+
+      if (st.stop_requested() || stop_.load(std::memory_order_acquire)) {
+        while (q_.try_dequeue(task)) task();
         return;
       }
-      Task t;
-      if (queue_.try_dequeue(t)) {
-        t();
-      }
+
+      std::unique_lock lk(m_);
+      cv_.wait(lk, st, [this]{ return stop_.load(std::memory_order_acquire) || pending_ > 0; });
     }
   }
 
-  detail::MSQueue<Task> queue_;
-  std::counting_semaphore<std::numeric_limits<int>::max()> sem_;
-  std::vector<std::jthread> workers_;
+  ms_queue<task_type> q_{};
+  std::vector<std::jthread> workers_{};
+
+  std::mutex m_{};
+  std::condition_variable_any cv_{};
+  std::atomic<bool> stop_{false};
+  std::size_t pending_{0}; // guarded by m_
 };
 
-} // namespace detail
-
-// Public alias for convenience
-using jthread_pool = detail::JThreadPool;
-
-} // namespace msjp
+} // namespace ms

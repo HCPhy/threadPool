@@ -7,8 +7,14 @@
       "command": "sh",
       "args": [
         "-lc",
-        "mkdir -p bin && clang++ -std=c++20 -O2 -Wall -Wextra -I include -I . src/main.cpp -pthread -o bin/demo"
+        "mkdir -p bin && g++ -std=c++20 -O2 -Wall -Wextra -I include -I . src/main.cpp -pthread -o bin/demo"
       ],
+      "osx": {
+        "args": [
+          "-lc",
+          "mkdir -p bin && /opt/homebrew/opt/llvm/bin/clang++ -std=c++20 -stdlib=libc++ -O2 -Wall -Wextra -I include -I . src/main.cpp -o bin/demo"
+        ]
+      },
       "group": { "kind": "build", "isDefault": true },
       "problemMatcher": ["$gcc"]
     }
