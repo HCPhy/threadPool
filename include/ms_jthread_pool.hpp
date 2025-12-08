@@ -17,7 +17,7 @@ namespace ms {
 
 // ---------- minimal hazard pointers (just enough for MS queue head) ----------
 struct hazard_domain {
-  static constexpr std::size_t max_slots = 1024;
+  static constexpr std::size_t max_slots = 2048; // enough for ~1000 threads with 2 slots each
   std::atomic<void*> slots[max_slots]{}; // cleared to nullptr
   std::atomic<unsigned> next{0};
 
@@ -53,16 +53,26 @@ class ms_queue {
   static thread_local std::vector<node*> retired_;
   static constexpr std::size_t retire_scan_threshold_ = 64;
 
-  unsigned hazard_slot_() const {
-    static thread_local unsigned slot = global_hazard_domain().acquire_slot();
-    return slot;
+  struct thread_slots {
+    unsigned slot0;
+    unsigned slot1;
+  };
+
+  const thread_slots& get_slots_() const {
+    static thread_local thread_slots s = {
+      global_hazard_domain().acquire_slot(),
+      global_hazard_domain().acquire_slot()
+    };
+    return s;
   }
-  void protect_(node* p) const noexcept {
-    global_hazard_domain().slots[hazard_slot_()].store(p, std::memory_order_release);
+
+  void protect_(unsigned slot_idx, node* p) const noexcept {
+    global_hazard_domain().slots[slot_idx].store(p, std::memory_order_release);
   }
-  void clear_hazard_() const noexcept {
-    global_hazard_domain().slots[hazard_slot_()].store(nullptr, std::memory_order_release);
+  void clear_slot_(unsigned slot_idx) const noexcept {
+    global_hazard_domain().slots[slot_idx].store(nullptr, std::memory_order_release);
   }
+
   void retire_or_delete_(node* old) {
     auto& hd = global_hazard_domain();
     if (!hd.any_holds(old)) { delete old; return; }
@@ -91,13 +101,18 @@ public:
 
   void enqueue(T v) {
     node* n = new node(std::move(v));
+    const auto& s = get_slots_();
     for (;;) {
       node* t = tail_.load(std::memory_order_acquire);
+      protect_(s.slot0, t);
+      if (t != tail_.load(std::memory_order_acquire)) continue; // tail changed
+
       node* next = t->next.load(std::memory_order_acquire);
       if (t == tail_.load(std::memory_order_acquire)) {
         if (next == nullptr) {
           if (t->next.compare_exchange_weak(next, n, std::memory_order_release, std::memory_order_acquire)) {
             tail_.compare_exchange_strong(t, n, std::memory_order_release, std::memory_order_acquire);
+            clear_slot_(s.slot0);
             return;
           }
         } else {
@@ -108,31 +123,96 @@ public:
   }
 
   bool try_dequeue(T& out) {
+    const auto& s = get_slots_();
     for (;;) {
       node* h = head_.load(std::memory_order_acquire);
-      protect_(h);
-      if (h != head_.load(std::memory_order_acquire)) continue;
+      protect_(s.slot0, h);
+      if (h != head_.load(std::memory_order_acquire)) {
+        // Head changed during protection, retry
+        continue;
+      }
+      
       node* t = tail_.load(std::memory_order_acquire);
       node* next = h->next.load(std::memory_order_acquire);
-      if (h == head_.load(std::memory_order_acquire)) {
+      
+      // Protect next *before* we potentially use it or retire h
+      protect_(s.slot1, next);
+      
+      // Re-validate h has not changed to ensure 'next' is still a valid successor of the current head
+      // and that h has not been retired/reused.
+      if (h != head_.load(std::memory_order_acquire)) {
+        continue;
+      }
+      
+      if (next == nullptr) {
+        // Queue likely empty, but need to check if t == h
+        // If h == t and next is null, queue is truly empty
         if (h == t) {
-          if (next == nullptr) { clear_hazard_(); return false; }
-          tail_.compare_exchange_strong(t, next, std::memory_order_release, std::memory_order_acquire);
-        } else {
-          out = std::move(next->value);
-          if (head_.compare_exchange_strong(h, next, std::memory_order_release, std::memory_order_acquire)) {
-            clear_hazard_();
-            retire_or_delete_(h);
-            return true;
-          }
+            clear_slot_(s.slot0);
+            clear_slot_(s.slot1);
+            return false;
+        }
+        // If h != t (and next is null), concurrent enqueue in progress?
+        // Fall through to retry or advance tail logic?
+        // Standard MS queue algorithm: if next is null, it might be empty if h==t.
+        // If h!=t and next is null, then tail is lagging.
+        // But with next == null, we can't dequeue.
+        // Let's re-read standard logic.
+        // "if head == tail ... if next == null -> empty"
+        // Wait, if I'm here, h is protected.
+        // If queue is empty, next is null. 
+        // We cleared slot0/1 and returned false.
+      }
+      
+      // If we are here, next might be non-null.
+      
+      // Standard MS checks:
+      if (h == t) {
+        // Queue might be empty or tail falling behind
+        if (next == nullptr) {
+          clear_slot_(s.slot0);
+          clear_slot_(s.slot1);
+          return false;
+        }
+        // Tail is falling behind, try to advance it
+        tail_.compare_exchange_strong(t, next, std::memory_order_release, std::memory_order_acquire);
+      } else {
+        // h != t, and we have a next.
+        // Read value from next BEFORE CAS head.
+        // next is protected by slot1. 
+        if (next) { // Should be non-null if h!=t in a valid state usually, but check
+             out = std::move(next->value);
+             if (head_.compare_exchange_strong(h, next, std::memory_order_release, std::memory_order_acquire)) {
+               // Success!
+               
+               // We need to clear slots before retiring h, 
+               // although retiring h is safe because we (this thread) hold h in slot0? 
+               // No, we retire h so WE release our claim, but we check if OTHERS hold it.
+               // We must clear OUR slot0 so we don't prevent reclamation of h in our own scan?
+               // Actually scan checks "any_holds".
+               // Conventionally: clear slots then retire.
+               clear_slot_(s.slot0);
+               clear_slot_(s.slot1); 
+               retire_or_delete_(h);
+               return true;
+             }
         }
       }
     }
   }
 
   bool empty() const {
+    const auto& s = get_slots_();
     node* h = head_.load(std::memory_order_acquire);
-    return h->next.load(std::memory_order_acquire) == nullptr;
+    protect_(s.slot0, h);
+    if (h != head_.load(std::memory_order_acquire)) {
+        // It changed, just best effort
+        clear_slot_(s.slot0);
+        return false; // conservative
+    }
+    bool is_empty = (h->next.load(std::memory_order_acquire) == nullptr);
+    clear_slot_(s.slot0);
+    return is_empty;
   }
 };
 template <class T>
@@ -152,15 +232,18 @@ public:
   }
 
   ~jthread_pool() {
-    request_stop();
-    cv_.notify_all(); // wake sleepers so they observe stop
+    request_stop(); 
     // std::jthread dtor joins (and requests stop) automatically
+    // but we notify in request_stop now.
   }
 
   jthread_pool(const jthread_pool&) = delete;
   jthread_pool& operator=(const jthread_pool&) = delete;
 
-  void request_stop() noexcept { stop_.store(true, std::memory_order_release); }
+  void request_stop() noexcept { 
+      stop_.store(true, std::memory_order_release); 
+      cv_.notify_all();
+  }
 
   template <class F, class... Args>
   auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
