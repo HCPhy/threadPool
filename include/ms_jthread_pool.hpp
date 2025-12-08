@@ -174,9 +174,12 @@ public:
     std::future<R> fut = sp_task->get_future();
 
     task_type t = [sp_task]() mutable { (*sp_task)(); }; // copies shared_ptr
+    
+    // Increment valid task count before enqueueing to ensure a waking worker sees it.
+    pending_task_count_.fetch_add(1, std::memory_order_release);
     q_.enqueue(std::move(t));
 
-    { std::scoped_lock lk(m_); ++pending_; }
+    // Wake one worker. We do not need to hold the lock for notification.
     cv_.notify_one();
     return fut;
   }
@@ -187,28 +190,39 @@ private:
   void worker_loop_(std::stop_token st) {
     for (;;) {
       task_type task;
+      // Fast path: loop while we can get tasks, without locking.
       while (q_.try_dequeue(task)) {
-        { std::scoped_lock lk(m_); if (pending_ > 0) --pending_; }
+        // We consumed a task from the queue.
+        pending_task_count_.fetch_sub(1, std::memory_order_release);
         task();
       }
 
       if (st.stop_requested() || stop_.load(std::memory_order_acquire)) {
+        // Drain remaing tasks then exit
         while (q_.try_dequeue(task)) task();
         return;
       }
 
+      // Slow path: no task found, wait for notification.
       std::unique_lock lk(m_);
-      cv_.wait(lk, st, [this]{ return stop_.load(std::memory_order_acquire) || pending_ > 0; });
+      // Predicate: stop requested OR pending tasks available.
+      // Note: We might wake up and fail to dequeue (some other worker got it), 
+      // but that is handled by the outer loop which retries the inner while(try_dequeue).
+      cv_.wait(lk, st, [this]{ 
+        return stop_.load(std::memory_order_acquire) || 
+               pending_task_count_.load(std::memory_order_acquire) > 0; 
+      });
     }
   }
 
   ms_queue<task_type> q_{};
-  std::vector<std::jthread> workers_{};
 
   std::mutex m_{};
   std::condition_variable_any cv_{};
   std::atomic<bool> stop_{false};
-  std::size_t pending_{0}; // guarded by m_
+  std::atomic<std::ptrdiff_t> pending_task_count_{0};
+  
+  std::vector<std::jthread> workers_{};
 };
 
 } // namespace ms
