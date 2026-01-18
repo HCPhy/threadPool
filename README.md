@@ -8,7 +8,7 @@ This project is a **safe space** to learn how modern, high-performance C++ threa
 We use **C++20**, **Lock-Free Queues**, and **Hazard Pointers**, but we explain it all in plain English.
 
 > **Status**: Hardened & Verified.
-> This implementation now includes a robust Hazard Pointer memory reclamation system, exception safety, and clean shutdown logic.
+> This implementation includes a robust Lock-Free MPMC Queue, Hazard Pointer memory reclamation, and correct "Event Count" notification logic to prevent lost wakeups and shutdowns races.
 
 ---
 
@@ -30,8 +30,8 @@ Learn about:
 Learn about:
 
 - **`std::jthread`** (The self-cleaning thread)
-- **Atomic Memory Ordering** (Sending packages across threads)
-- **The Worker Loop** (How threads find work)
+- **Event Counts** (How we wake threads without races)
+- **The Worker Loop** (How threads find work efficiently)
 - **Memory Reclamation** (How we clean up trash safely)
 
 ---
@@ -42,10 +42,10 @@ Want to see it run? Copy-paste this into your terminal:
 
 ```bash
 # Compile (You need a modern C++ compiler like g++ 10 or clang 10)
-g++ -std=c++20 -pthread -Iinclude src/main.cpp -o main
+make run_stress
 
-# Run it!
-./main
+# Run performance benchmark
+make run_compute
 ```
 
 ### Code Example
@@ -77,12 +77,13 @@ int main() {
 ## 📁 What's Inside?
 
 - `include/ms_jthread_pool.hpp`: **The Whole Enchilada**. The entire library is in this one file.
-- `src/main.cpp`: A test script to prove it works.
+- `test/stress_test.cpp`: Proof that it handles heavy load.
 - `docs/`: The friendly documentation.
 
 ## ⚠️ Safety Notes
 
 This is a lock-free implementation designed for education and high performance.
 
-- **Shutdown**: By default, the pool "safely leaks" some memory on process exit to avoid crashes (races during static destruction).
-- **Manual Drain**: If you need 0 leaks (e.g. for valgrind tests), you can call `ms::ms_queue<T>::drain_retired()`, but **ONLY** when all threads are finished.
+- **Shutdown**: The pool correctly serializes shutdown with submission. It joins workers and cleans up the queue automatically.
+- **Teardown**: Internal "Leaky Singletons" ensure Global Hazard Pointers survive thread-local destruction, so no crashes at program exit.
+- **Verification**: Run `make run_queue` to verify MPMC correctness under rigorous contention.

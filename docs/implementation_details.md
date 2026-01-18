@@ -78,10 +78,12 @@ When we delete a node, we can't just `delete` it (someone might be looking at it
 
 ### Clean Shutdown
 
-Threads are messy. When the program ends, some "trash" nodes might still be waiting to be deleted.
+Threads are messy. When the program ends, we need to be careful about destruction order.
 
-- **Default**: We intentionally "leak" them to the OS. This is safer than trying to delete them while other threads might race to access them during a chaotic shutdown.
-- **Manual Drain**: If you NEED to verify 0 leaks (e.g., in tests), you can call `ms_queue::drain_retired()`. But be careful! **Only do this when all threads are dead.**
+1. **Leaky Singletons**: We use "Immortal" global objects for the Hazard Domain. They are allocated with `new` and never `delete`d.
+    - *Why?* To prevent "Use-After-Destruct" bugs where a thread tries to retire a node after the global manager has already been destroyed at program exit.
+2. **Automatic Cleanup**: The Pool destructor joins all threads first. Once all threads are stopped, we know no one is using the queue.
+    - Then we safely walk the queue and delete all remaining nodes. No leaks!
 
 ---
 
@@ -91,11 +93,10 @@ Each thread runs a loop that looks for work. It has two modes: **Fast Mode** and
 
 ```mermaid
 graph TD
-    Start[Start Loop] --> CheckQ{Is Queue Empty?}
-    CheckQ -- No (Tasks Found) --> Dequeue[Fast Path: Grab Task!]
-    Dequeue --> Execute[Run Task]
+    Start[Start Loop] --> CheckQ{Try Dequeue}
+    CheckQ -- Success --> Execute[Run Task]
     Execute --> Start
-    CheckQ -- Yes (Empty) --> SlowPath[Slow Path: Go to Sleep]
+    CheckQ -- Fail --> SlowPath[Slow Path: Check Event Count]
     SlowPath --> Wait[Wait on Condition Variable]
     Wait --> WakeUp[Woken Up!]
     WakeUp --> Start
@@ -108,15 +109,20 @@ If there is work, we just grab it. No locks, no waiting. It's blazing fast âš¡ï¸
 ```cpp
 // Fast path: loop while we can get tasks, without locking.
 while (q_.try_dequeue(task)) {
-  pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
-  task();
+  task(); // Just do it!
 }
 ```
 
-### The Slow Path (Sleeping)
+### The Slow Path (Event Counts)
 
-If the queue is empty, we don't want to spin in a circle burning CPU (making your laptop fan go crazy). So we go to sleep.
-We use a separate mutex `cv_mutex_` to avoid blocking submitters while workers sleep.
+If the queue is empty, we don't want to spin. But checking `empty()` and then sleeping is race-prone (the "lost wakeup" problem).
+
+We use a monotonic **Event Count** (`wake_seq_`):
+
+1. **Submitter**: Enqueues task -> Increments `wake_seq_` -> Notifies.
+2. **Worker**: Memorizes `wake_seq_` -> Tries Dequeue -> If empty, Sleeps *only if* `wake_seq_` hasn't changed.
+
+This guarantees we never go to sleep after a task has arrived.
 
 ---
 

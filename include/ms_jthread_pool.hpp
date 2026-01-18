@@ -355,6 +355,7 @@ public:
   }
 };
 
+
 // --------------------------------- thread pool --------------------------------
 class jthread_pool {
 public:
@@ -370,20 +371,21 @@ public:
 
   ~jthread_pool() {
     request_stop();
-    workers_.clear();                 // joins all workers
-    ms_queue<task_type>::drain_retired(); // now safe: no live hazards from workers
+    workers_.clear();                  // joins all workers
+    ms_queue<task_type>::drain_retired(); // safe now: no live worker hazards
   }
 
   jthread_pool(const jthread_pool&) = delete;
   jthread_pool& operator=(const jthread_pool&) = delete;
 
-  // Key fix: serialize stop with submit via submit_mutex_, and keep lock order consistent:
+  // Serialize stop with submit via submit_mutex_, keep lock order:
   // submit_mutex_ -> cv_mutex_
   void request_stop() noexcept {
     {
       std::lock_guard lk(submit_mutex_);
       std::lock_guard lk2(cv_mutex_);
       stop_.store(true, std::memory_order_release);
+      wake_seq_.fetch_add(1, std::memory_order_release); // publish a wake event
     }
     cv_.notify_all();
   }
@@ -402,22 +404,13 @@ public:
       if (stop_.load(std::memory_order_acquire))
         throw std::runtime_error("jthread_pool stopped");
 
-      // Publish "pending" BEFORE enqueue to make the CV predicate reliable.
-      // Keep the increment under cv_mutex_ so state changes are coherent with waiters.
+      // 1) enqueue first (so work is really present)
+      q_.enqueue(std::move(t));
+
+      // 2) publish a wake event under cv_mutex_ for coherent waiting
       {
         std::lock_guard lk2(cv_mutex_);
-        pending_task_count_.fetch_add(1, std::memory_order_release);
-      }
-
-      // Enqueue while still holding submit_mutex_ so request_stop() can't interleave
-      // and cause "stop + workers exit" while a submit sneaks in.
-      try {
-        q_.enqueue(std::move(t));
-      } catch (...) {
-        // Rollback pending count if enqueue throws
-        auto prev = pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
-        assert(prev > 0 && "pending_task_count_ underflow on rollback");
-        throw;
+        wake_seq_.fetch_add(1, std::memory_order_release);
       }
     }
 
@@ -429,58 +422,42 @@ public:
 
 private:
   void worker_loop_(std::stop_token /*st*/) {
+    std::uint64_t seen = wake_seq_.load(std::memory_order_acquire);
+
     for (;;) {
       task_type task;
 
       // Drain available tasks without holding cv_mutex_
       while (q_.try_dequeue(task)) {
-        auto prev = pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
-        assert(prev > 0 && "pending_task_count_ underflow");
         task();
       }
 
-      // Sleep until there is work or stop
-      std::unique_lock lk(cv_mutex_);
-      cv_.wait(lk, [this]{
-        return stop_.load(std::memory_order_acquire) ||
-               pending_task_count_.load(std::memory_order_acquire) > 0;
-      });
-
-      // If stop was requested, drain remaining pending work and exit.
+      // If stop requested, drain remaining and exit.
       if (stop_.load(std::memory_order_acquire)) {
-        lk.unlock();
-
-        // Since submit() is serialized with request_stop() via submit_mutex_,
-        // once stop_ is set, no new pending tasks can be published.
-        for (;;) {
-          // Drain whatever is in the queue
-          while (q_.try_dequeue(task)) {
-            auto prev = pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
-            assert(prev > 0 && "pending_task_count_ underflow");
-            task();
-          }
-
-          // If all published work is done, exit
-          if (pending_task_count_.load(std::memory_order_acquire) == 0)
-            return;
-
-          // There is published work but queue is momentarily empty (submit published pending
-          // but hasn't enqueued yet, or another worker stole). Yield briefly and retry.
-          std::this_thread::yield();
-        }
+        while (q_.try_dequeue(task)) task();
+        return;
       }
+
+      // Sleep until a new wake event or stop.
+      std::unique_lock lk(cv_mutex_);
+      cv_.wait(lk, [this, &seen]{
+        return stop_.load(std::memory_order_acquire) ||
+               wake_seq_.load(std::memory_order_acquire) != seen;
+      });
+      seen = wake_seq_.load(std::memory_order_acquire);
+      // loop continues; we’ll try_dequeue again
     }
   }
 
   ms_queue<task_type> q_{};
 
   std::condition_variable_any cv_;
-  std::mutex cv_mutex_;       // protects CV protocol coherence (predicate state)
-  std::mutex submit_mutex_;   // serializes submit vs stop and prevents stop/submit races
+  std::mutex cv_mutex_;
+  std::mutex submit_mutex_;
   std::atomic<bool> stop_{false};
 
-  // "Published" count of tasks expected to be executed (enqueue may lag slightly)
-  std::atomic<std::ptrdiff_t> pending_task_count_{0};
+  // Monotonic “event count” for waking sleepers (no underflow / no spin window)
+  std::atomic<std::uint64_t> wake_seq_{0};
 
   std::vector<std::jthread> workers_{};
 };
