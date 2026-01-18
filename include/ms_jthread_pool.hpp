@@ -13,26 +13,38 @@
 #include <utility>
 #include <vector>
 #include <stdexcept>
+#include <stack>
+#include <optional>
+#include <algorithm>
 
 namespace ms {
 
 // ---------- minimal hazard pointers (just enough for MS queue head) ----------
 struct hazard_domain {
-  static constexpr std::size_t max_slots = 2048; // enough for ~1000 threads with 2 slots each
+  static constexpr std::size_t max_slots = 2048; 
   std::atomic<void*> slots[max_slots]{}; // cleared to nullptr
-  std::atomic<unsigned> next{0};
+  
+  // Slot management
+  std::mutex m_slot;
+  std::stack<unsigned> free_slots;
+  unsigned next_index{0}; 
 
   unsigned acquire_slot() {
-    unsigned id = next.fetch_add(1, std::memory_order_relaxed);
-    if (id >= max_slots) throw std::runtime_error("hazard_domain: out of slots");
-    return id;
+    std::lock_guard<std::mutex> lk(m_slot);
+    if (!free_slots.empty()) {
+      unsigned id = free_slots.top();
+      free_slots.pop();
+      return id;
+    }
+    if (next_index >= max_slots) throw std::runtime_error("hazard_domain: out of slots");
+    return next_index++;
   }
-  bool any_holds(void* p) const noexcept {
-    for (std::size_t i = 0; i < max_slots; ++i)
-      if (slots[i].load(std::memory_order_acquire) == p) return true;
-    return false;
+
+  void return_slot(unsigned id) {
+    std::lock_guard<std::mutex> lk(m_slot);
+    slots[id].store(nullptr, std::memory_order_release); 
+    free_slots.push(id);
   }
-  
 };
 
 inline hazard_domain& global_hazard_domain() {
@@ -45,7 +57,7 @@ template <class T>
 class ms_queue {
   struct node {
     std::atomic<node*> next{nullptr};
-    T value; // dummy head has default-constructed T
+    std::optional<T> value; 
     node() = default;
     explicit node(T v) : value(std::move(v)) {}
   };
@@ -53,8 +65,97 @@ class ms_queue {
   std::atomic<node*> head_{nullptr};
   std::atomic<node*> tail_{nullptr};
 
-  static inline thread_local std::vector< typename ms_queue<T>::node* > retired_{};
-  static constexpr std::size_t retire_scan_threshold_ = 64;
+  // Thread-local retirement manager
+  struct RetirementManager {
+      std::vector<node*> retired_list;
+      static constexpr std::size_t threshold = 64;
+
+      ~RetirementManager() {
+          // Push remaining retired nodes to global pool on thread exit
+          global_retire_.add(retired_list);
+      }
+
+      void push(node* n) {
+          retired_list.push_back(n);
+          if (retired_list.size() >= threshold) {
+              scan();
+          }
+      }
+
+      void scan() {
+          auto& hd = global_hazard_domain();
+          std::vector<void*> snapshot;
+          
+          {
+             std::lock_guard<std::mutex> lk(hd.m_slot);
+             // Snapshot active hazards
+             unsigned limit = hd.next_index;
+             snapshot.reserve(limit);
+             for (unsigned i = 0; i < limit; ++i) {
+                 snapshot.push_back(hd.slots[i].load(std::memory_order_acquire));
+             }
+          } 
+
+          // Steal from global retirement occasionally (e.g. if we have few local nodes, or always try)
+          global_retire_.steal_to(retired_list);
+
+          // Sort snapshot for binary search O(S log S)
+          std::sort(snapshot.begin(), snapshot.end());
+          
+          // Skip nullptrs (which sort to the beginning)
+          auto range_start = std::upper_bound(snapshot.begin(), snapshot.end(), (void*)nullptr);
+
+          // Filter without holding the lock
+          auto it = retired_list.begin();
+          while (it != retired_list.end()) {
+              if (std::binary_search(range_start, snapshot.end(), static_cast<void*>(*it))) {
+                  // Held
+                  ++it;
+              } else { 
+                  delete *it; 
+                  it = retired_list.erase(it); 
+              }
+          }
+      }
+  };
+
+  struct GlobalRetirement {
+      std::mutex m;
+      std::vector<node*> list;
+      
+      void add(std::vector<node*>& v) {
+          if (v.empty()) return;
+          std::lock_guard<std::mutex> lk(m);
+          list.insert(list.end(), v.begin(), v.end());
+          v.clear();
+      }
+      
+      void steal_to(std::vector<node*>& v) {
+          std::unique_lock<std::mutex> lk(m, std::try_to_lock);
+          if (lk.owns_lock() && !list.empty()) {
+              v.insert(v.end(), list.begin(), list.end());
+              list.clear();
+          }
+      }
+      
+      ~GlobalRetirement() {
+          // Intentionally leak on shutdown to avoid race with live hazards/threads.
+          // OS will reclaim memory.
+      }
+      
+      void drain() {
+          std::lock_guard<std::mutex> lk(m);
+          for (auto n : list) delete n;
+          list.clear();
+      }
+  };
+
+  static inline GlobalRetirement global_retire_;
+
+  static RetirementManager& get_retire_manager() {
+      static thread_local RetirementManager rm;
+      return rm;
+  }
 
   struct hp_owner {
     unsigned slot0, slot1;
@@ -65,8 +166,8 @@ class ms_queue {
     }
     ~hp_owner() {
       auto& hd = global_hazard_domain();
-      hd.slots[slot0].store(nullptr, std::memory_order_release);
-      hd.slots[slot1].store(nullptr, std::memory_order_release);
+      hd.return_slot(slot0);
+      hd.return_slot(slot1);
     }
   };
 
@@ -76,25 +177,28 @@ class ms_queue {
   }
 
   void retire_or_delete_(node* old) {
-    auto& hd = global_hazard_domain();
-    if (!hd.any_holds(old)) { delete old; return; }
-    retired_.push_back(old);
-    if (retired_.size() >= retire_scan_threshold_) {
-      auto it = retired_.begin();
-      while (it != retired_.end()) {
-        if (!hd.any_holds(*it)) { delete *it; it = retired_.erase(it); }
-        else { ++it; }
-      }
-    }
+      get_retire_manager().push(old);
   }
 
 public:
+  // DANGER: Only call this when ALL threads that ever touched ANY ms_queue instance 
+  // are dead or quiescent (no active hazards, no TLS flushing).
+  // Specifically: all thread_local destructors for RetirementManager must have completed.
+  // This is typically called at strictly serialized process exit.
+  static void drain_retired() {
+      global_retire_.drain();
+  }
+
   ms_queue() {
     node* dummy = new node();
     head_.store(dummy, std::memory_order_relaxed);
     tail_.store(dummy, std::memory_order_relaxed);
   }
   ~ms_queue() {
+    // REQUIREMENT: External synchronization required.
+    // No other threads may access the queue during destruction.
+    // All threads must have returned any hazard slots (hp_owner destroyed) before domain destruction.
+    // (hazard_domain is static so it outlives queue).
     node* n = head_.load(std::memory_order_relaxed);
     while (n) { node* next = n->next.load(std::memory_order_relaxed); delete n; n = next; }
   }
@@ -103,48 +207,55 @@ public:
 
   void enqueue(T v) {
     node* n = new node(std::move(v));
-    // Use HP to protect tail? Standard MS queue usually doesn't need HP for tail traversal 
-    // because tail always points to a valid node (or we restart). 
-    // However, for consistency and safety against extreme reclamation cases (if tail was retired):
-    // Standard MS doesn't protect tail with HP, only Head. 
-    // But if we want to be super safe, we can. The HEAD version protected tail.
-    // Let's stick to Local version (standard) or HEAD?
-    // HEAD version: protecting tail.
-    // Local version (my fix): standard implementation (no tail protection).
-    // Standard MS queue: tail is not accessed for *value*, only next. 
-    // And if tail is retired, tail->next is still accessible? 
-    // No, if tail is deleted, tail->next is segfault.
-    // BUT, tail is only deleted when it leaves implementation? 
-    // A node is only retired when it is dequeued. 
-    // Can tail be dequeued? Yes, if queue becomes empty, head catches up to tail.
-    // So tail node can be retired.
-    // So Concurrent Enqueue needs to protect tail. 
-    // My previous analysis (Steps 1-21) didn't add protection to tail in enqueue. 
-    // HEAD *did*. I should probably Adopt HEAD's tail protection for robustness.
-    
     auto& hp = get_hp_();
     auto& hd = global_hazard_domain();
     
     for (;;) {
       node* t = tail_.load(std::memory_order_acquire);
-      // Protect tail
+      // Protect tail (slot 0)
       hd.slots[hp.slot0].store(t, std::memory_order_release);
-      std::atomic_thread_fence(std::memory_order_seq_cst);
-      if (t != tail_.load(std::memory_order_acquire)) continue;
+      if (t != tail_.load(std::memory_order_acquire)) {
+          // Retry immediately.
+          hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
+          hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
+          continue; 
+      }
 
       node* next = t->next.load(std::memory_order_acquire);
-
+      // Protect next (slot 1)
+      hd.slots[hp.slot1].store(next, std::memory_order_release);
+      
+      // Strict Re-validation
+      if (t != tail_.load(std::memory_order_acquire)) {
+          hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
+          hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
+          continue;
+      }
+      
+      if (next != t->next.load(std::memory_order_acquire)) {
+          hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
+          hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
+          continue; 
+      }
+      
       if (t == tail_.load(std::memory_order_acquire)) {
         if (next == nullptr) {
-          if (t->next.compare_exchange_weak(next, n, std::memory_order_release, std::memory_order_acquire)) {
-            tail_.compare_exchange_strong(t, n, std::memory_order_release, std::memory_order_acquire);
+          if (t->next.compare_exchange_weak(next, n, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            tail_.compare_exchange_strong(t, n, std::memory_order_acq_rel, std::memory_order_acquire);
             hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
+            hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
             return;
           }
+          hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
         } else {
-          tail_.compare_exchange_strong(t, next, std::memory_order_release, std::memory_order_acquire);
+          // tail lagging, help advance
+          tail_.compare_exchange_strong(t, next, std::memory_order_acq_rel, std::memory_order_acquire);
+          hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
         }
-      }
+      } 
+      // Failed CAS, clear slots and retry
+      hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
+      hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
     }
   }
 
@@ -156,20 +267,31 @@ public:
       node* h = head_.load(std::memory_order_acquire);
       // Protect head (slot 0)
       hd.slots[hp.slot0].store(h, std::memory_order_release);
-      std::atomic_thread_fence(std::memory_order_seq_cst);
-      if (h != head_.load(std::memory_order_acquire)) continue;
+      if (h != head_.load(std::memory_order_acquire)) {
+          hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
+          hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
+          continue; 
+      }
       
       node* t = tail_.load(std::memory_order_acquire);
       node* next = h->next.load(std::memory_order_acquire);
 
-      // Protect next (slot 1) - required before accessing valid fields or taking ownership
+      // Protect next (slot 1)
       hd.slots[hp.slot1].store(next, std::memory_order_release);
-      std::atomic_thread_fence(std::memory_order_seq_cst);
 
       // Re-validate head
-      if (h != head_.load(std::memory_order_acquire)) continue;
-      // Re-validate next is still h->next (consistency check)
-      if (next != h->next.load(std::memory_order_acquire)) continue;
+      if (h != head_.load(std::memory_order_acquire)) {
+          hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
+          hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
+          continue;
+      }
+      
+      // Re-validate next is still h->next
+      if (next != h->next.load(std::memory_order_acquire)) {
+          hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
+          hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
+          continue;
+      }
 
       if (h == t) {
         if (next == nullptr) {
@@ -178,13 +300,24 @@ public:
           hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
           return false;
         }
-        tail_.compare_exchange_strong(t, next, std::memory_order_release, std::memory_order_acquire);
+        // Help advance tail
+        tail_.compare_exchange_strong(t, next, std::memory_order_acq_rel, std::memory_order_acquire);
+        
+        hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
+        hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
       } else {
-        if (next == nullptr) continue; 
+        if (next == nullptr) {
+             // Inconsistent, retry
+             hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
+             hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
+             continue; 
+        }
         
         // Move AFTER winning the CAS
-        if (head_.compare_exchange_strong(h, next, std::memory_order_release, std::memory_order_acquire)) {
-          out = std::move(next->value);
+        if (head_.compare_exchange_strong(h, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+          assert(next->value.has_value());
+          out = std::move(*next->value);
+          next->value.reset(); // Destroy moved-from object immediately
           
           hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
           hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
@@ -192,6 +325,8 @@ public:
           retire_or_delete_(h);
           return true;
         }
+        hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
+        hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
       }
     }
   }
@@ -202,14 +337,12 @@ public:
     
     node* h = head_.load(std::memory_order_acquire);
     hd.slots[hp.slot0].store(h, std::memory_order_release);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
     
     if (h != head_.load(std::memory_order_acquire)) {
         hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
         return false; // conservative
     }
     
-    // Accessing h->next is safe because h is protected
     bool is_empty = (h->next.load(std::memory_order_acquire) == nullptr);
     hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
     return is_empty;
@@ -251,16 +384,19 @@ public:
     if (stop_.load(std::memory_order_acquire)) 
       throw std::runtime_error("jthread_pool stopped");
 
-    // Bind to nullary and wrap in shared_ptr so the task is copyable for std::function
     auto bound = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
     auto sp_task = std::make_shared<std::packaged_task<R()>>(std::move(bound));
     std::future<R> fut = sp_task->get_future();
 
     task_type t = [sp_task]() mutable { (*sp_task)(); }; // copies shared_ptr
     
-    // Increment valid task count before enqueueing to ensure a waking worker sees it.
-    pending_task_count_.fetch_add(1, std::memory_order_release);
-    q_.enqueue(std::move(t));
+    pending_task_count_.fetch_add(1, std::memory_order_acq_rel);
+    try {
+        q_.enqueue(std::move(t));
+    } catch (...) {
+        pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
+        throw;
+    }
 
     cv_.notify_one();
     return fut;
@@ -275,14 +411,14 @@ private:
       // Fast path: loop while we can get tasks, without locking.
       while (q_.try_dequeue(task)) {
         // We consumed a task from the queue.
-        pending_task_count_.fetch_sub(1, std::memory_order_release);
+        pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
         task();
       }
 
       if (st.stop_requested() || stop_.load(std::memory_order_acquire)) {
         // Drain remaing tasks then exit
         while (q_.try_dequeue(task)) {
-             pending_task_count_.fetch_sub(1, std::memory_order_release);
+             pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
              task();
         }
         return;
