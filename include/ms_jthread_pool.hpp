@@ -12,6 +12,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <stdexcept>
 
 namespace ms {
 
@@ -31,7 +32,9 @@ struct hazard_domain {
       if (slots[i].load(std::memory_order_acquire) == p) return true;
     return false;
   }
+  
 };
+
 inline hazard_domain& global_hazard_domain() {
   static hazard_domain hd;
   return hd;
@@ -50,27 +53,26 @@ class ms_queue {
   std::atomic<node*> head_{nullptr};
   std::atomic<node*> tail_{nullptr};
 
-  static thread_local std::vector<node*> retired_;
+  static inline thread_local std::vector< typename ms_queue<T>::node* > retired_{};
   static constexpr std::size_t retire_scan_threshold_ = 64;
 
-  struct thread_slots {
-    unsigned slot0;
-    unsigned slot1;
+  struct hp_owner {
+    unsigned slot0, slot1;
+    hp_owner() {
+      auto& hd = global_hazard_domain();
+      slot0 = hd.acquire_slot();
+      slot1 = hd.acquire_slot();
+    }
+    ~hp_owner() {
+      auto& hd = global_hazard_domain();
+      hd.slots[slot0].store(nullptr, std::memory_order_release);
+      hd.slots[slot1].store(nullptr, std::memory_order_release);
+    }
   };
 
-  const thread_slots& get_slots_() const {
-    static thread_local thread_slots s = {
-      global_hazard_domain().acquire_slot(),
-      global_hazard_domain().acquire_slot()
-    };
-    return s;
-  }
-
-  void protect_(unsigned slot_idx, node* p) const noexcept {
-    global_hazard_domain().slots[slot_idx].store(p, std::memory_order_release);
-  }
-  void clear_slot_(unsigned slot_idx) const noexcept {
-    global_hazard_domain().slots[slot_idx].store(nullptr, std::memory_order_release);
+  hp_owner& get_hp_() const {
+    static thread_local hp_owner hp;
+    return hp;
   }
 
   void retire_or_delete_(node* old) {
@@ -101,18 +103,42 @@ public:
 
   void enqueue(T v) {
     node* n = new node(std::move(v));
-    const auto& s = get_slots_();
+    // Use HP to protect tail? Standard MS queue usually doesn't need HP for tail traversal 
+    // because tail always points to a valid node (or we restart). 
+    // However, for consistency and safety against extreme reclamation cases (if tail was retired):
+    // Standard MS doesn't protect tail with HP, only Head. 
+    // But if we want to be super safe, we can. The HEAD version protected tail.
+    // Let's stick to Local version (standard) or HEAD?
+    // HEAD version: protecting tail.
+    // Local version (my fix): standard implementation (no tail protection).
+    // Standard MS queue: tail is not accessed for *value*, only next. 
+    // And if tail is retired, tail->next is still accessible? 
+    // No, if tail is deleted, tail->next is segfault.
+    // BUT, tail is only deleted when it leaves implementation? 
+    // A node is only retired when it is dequeued. 
+    // Can tail be dequeued? Yes, if queue becomes empty, head catches up to tail.
+    // So tail node can be retired.
+    // So Concurrent Enqueue needs to protect tail. 
+    // My previous analysis (Steps 1-21) didn't add protection to tail in enqueue. 
+    // HEAD *did*. I should probably Adopt HEAD's tail protection for robustness.
+    
+    auto& hp = get_hp_();
+    auto& hd = global_hazard_domain();
+    
     for (;;) {
       node* t = tail_.load(std::memory_order_acquire);
-      protect_(s.slot0, t);
-      if (t != tail_.load(std::memory_order_acquire)) continue; // tail changed
+      // Protect tail
+      hd.slots[hp.slot0].store(t, std::memory_order_release);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (t != tail_.load(std::memory_order_acquire)) continue;
 
       node* next = t->next.load(std::memory_order_acquire);
+
       if (t == tail_.load(std::memory_order_acquire)) {
         if (next == nullptr) {
           if (t->next.compare_exchange_weak(next, n, std::memory_order_release, std::memory_order_acquire)) {
             tail_.compare_exchange_strong(t, n, std::memory_order_release, std::memory_order_acquire);
-            clear_slot_(s.slot0);
+            hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
             return;
           }
         } else {
@@ -123,100 +149,72 @@ public:
   }
 
   bool try_dequeue(T& out) {
-    const auto& s = get_slots_();
+    auto& hp = get_hp_();
+    auto& hd = global_hazard_domain();
+
     for (;;) {
       node* h = head_.load(std::memory_order_acquire);
-      protect_(s.slot0, h);
-      if (h != head_.load(std::memory_order_acquire)) {
-        // Head changed during protection, retry
-        continue;
-      }
+      // Protect head (slot 0)
+      hd.slots[hp.slot0].store(h, std::memory_order_release);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (h != head_.load(std::memory_order_acquire)) continue;
       
       node* t = tail_.load(std::memory_order_acquire);
       node* next = h->next.load(std::memory_order_acquire);
-      
-      // Protect next *before* we potentially use it or retire h
-      protect_(s.slot1, next);
-      
-      // Re-validate h has not changed to ensure 'next' is still a valid successor of the current head
-      // and that h has not been retired/reused.
-      if (h != head_.load(std::memory_order_acquire)) {
-        continue;
-      }
-      
-      if (next == nullptr) {
-        // Queue likely empty, but need to check if t == h
-        // If h == t and next is null, queue is truly empty
-        if (h == t) {
-            clear_slot_(s.slot0);
-            clear_slot_(s.slot1);
-            return false;
-        }
-        // If h != t (and next is null), concurrent enqueue in progress?
-        // Fall through to retry or advance tail logic?
-        // Standard MS queue algorithm: if next is null, it might be empty if h==t.
-        // If h!=t and next is null, then tail is lagging.
-        // But with next == null, we can't dequeue.
-        // Let's re-read standard logic.
-        // "if head == tail ... if next == null -> empty"
-        // Wait, if I'm here, h is protected.
-        // If queue is empty, next is null. 
-        // We cleared slot0/1 and returned false.
-      }
-      
-      // If we are here, next might be non-null.
-      
-      // Standard MS checks:
+
+      // Protect next (slot 1) - required before accessing valid fields or taking ownership
+      hd.slots[hp.slot1].store(next, std::memory_order_release);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+
+      // Re-validate head
+      if (h != head_.load(std::memory_order_acquire)) continue;
+      // Re-validate next is still h->next (consistency check)
+      if (next != h->next.load(std::memory_order_acquire)) continue;
+
       if (h == t) {
-        // Queue might be empty or tail falling behind
         if (next == nullptr) {
-          clear_slot_(s.slot0);
-          clear_slot_(s.slot1);
+          // Empty
+          hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
+          hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
           return false;
         }
-        // Tail is falling behind, try to advance it
         tail_.compare_exchange_strong(t, next, std::memory_order_release, std::memory_order_acquire);
       } else {
-        // h != t, and we have a next.
-        // Read value from next BEFORE CAS head.
-        // next is protected by slot1. 
-        if (next) { // Should be non-null if h!=t in a valid state usually, but check
-             out = std::move(next->value);
-             if (head_.compare_exchange_strong(h, next, std::memory_order_release, std::memory_order_acquire)) {
-               // Success!
-               
-               // We need to clear slots before retiring h, 
-               // although retiring h is safe because we (this thread) hold h in slot0? 
-               // No, we retire h so WE release our claim, but we check if OTHERS hold it.
-               // We must clear OUR slot0 so we don't prevent reclamation of h in our own scan?
-               // Actually scan checks "any_holds".
-               // Conventionally: clear slots then retire.
-               clear_slot_(s.slot0);
-               clear_slot_(s.slot1); 
-               retire_or_delete_(h);
-               return true;
-             }
+        if (next == nullptr) continue; 
+        
+        // Move AFTER winning the CAS
+        if (head_.compare_exchange_strong(h, next, std::memory_order_release, std::memory_order_acquire)) {
+          out = std::move(next->value);
+          
+          hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
+          hd.slots[hp.slot1].store(nullptr, std::memory_order_release);
+          
+          retire_or_delete_(h);
+          return true;
         }
       }
     }
   }
 
   bool empty() const {
-    const auto& s = get_slots_();
+    auto& hp = get_hp_();
+    auto& hd = global_hazard_domain();
+    
     node* h = head_.load(std::memory_order_acquire);
-    protect_(s.slot0, h);
+    hd.slots[hp.slot0].store(h, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    
     if (h != head_.load(std::memory_order_acquire)) {
-        // It changed, just best effort
-        clear_slot_(s.slot0);
+        hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
         return false; // conservative
     }
+    
+    // Accessing h->next is safe because h is protected
     bool is_empty = (h->next.load(std::memory_order_acquire) == nullptr);
-    clear_slot_(s.slot0);
+    hd.slots[hp.slot0].store(nullptr, std::memory_order_release);
     return is_empty;
   }
 };
-template <class T>
-thread_local std::vector<typename ms_queue<T>::node*> ms_queue<T>::retired_{};
 
 // --------------------------------- thread pool --------------------------------
 class jthread_pool {
@@ -231,10 +229,11 @@ public:
     }
   }
 
+
   ~jthread_pool() {
-    request_stop(); 
-    // std::jthread dtor joins (and requests stop) automatically
-    // but we notify in request_stop now.
+    request_stop();
+    cv_.notify_all();     // wake sleepers
+    workers_.clear();     
   }
 
   jthread_pool(const jthread_pool&) = delete;
@@ -249,7 +248,8 @@ public:
   auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
     using R = std::invoke_result_t<F, Args...>;
 
-    if (stop_.load(std::memory_order_acquire)) throw std::runtime_error("jthread_pool stopped");
+    if (stop_.load(std::memory_order_acquire)) 
+      throw std::runtime_error("jthread_pool stopped");
 
     // Bind to nullary and wrap in shared_ptr so the task is copyable for std::function
     auto bound = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
@@ -262,7 +262,6 @@ public:
     pending_task_count_.fetch_add(1, std::memory_order_release);
     q_.enqueue(std::move(t));
 
-    // Wake one worker. We do not need to hold the lock for notification.
     cv_.notify_one();
     return fut;
   }
@@ -282,7 +281,10 @@ private:
 
       if (st.stop_requested() || stop_.load(std::memory_order_acquire)) {
         // Drain remaing tasks then exit
-        while (q_.try_dequeue(task)) task();
+        while (q_.try_dequeue(task)) {
+             pending_task_count_.fetch_sub(1, std::memory_order_release);
+             task();
+        }
         return;
       }
 
@@ -299,7 +301,7 @@ private:
   }
 
   ms_queue<task_type> q_{};
-
+  
   std::mutex m_{};
   std::condition_variable_any cv_{};
   std::atomic<bool> stop_{false};
