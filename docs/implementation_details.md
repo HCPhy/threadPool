@@ -42,14 +42,50 @@ I'm writing a note to myself. It doesn't matter if you see it now or in 5 minute
 - **Release (Sending)**: I pack a box with data, tape it shut, and hand it to the driver. nothing I put *inside* the box can fall out.
 - **Acquire (Receiving)**: You get the box and open it. You are guaranteed to see everything I put in there.
 
-We use this for the Queue.
+We use this for the Queue and Hazard Pointers.
 
 1. **Producer**: Writes the data, then uses `Release` to update the `Tail` pointer.
 2. **Consumer**: Uses `Acquire` to read the `Head` pointer. This guarantees they see the data the producer wrote.
+3. **Hazards**: We use `acc_rel` (Acquire-Release) to ensure published hazard pointers are visible to everyone instantly.
 
 ---
 
-## 3. The Worker Loop (The Engine)
+## 3. Hazard Pointers & Reclamation (The Safety Net)
+
+We implemented a custom, lightweight Hazard Pointer system.
+
+### The `hp_owner` (RAII)
+
+Instead of manually managing slots, we use a C++ idiom called **RAII** (Resource Acquisition Is Initialization).
+When a thread wants to touch the queue, it creates an `hp_owner` object.
+
+- **Constructor**: Automatically borrows 2 slots from the global `hazard_domain`.
+- **Destructor**: Automatically returns them when the thread leaves the function.
+
+This guarantees we never "leak" slots, even if an exception is thrown!
+
+### The Retirement Strategy
+
+When we delete a node, we can't just `delete` it (someone might be looking at it).
+
+1. **Thread-Local Stash**: Each thread keeps a small list of "trash" nodes.
+2. **Scan**: When the stash gets full (64 items), we scan the global Hazard Pointers.
+   - We take a snapshot of all active hazards.
+   - We sort them (fast search!).
+   - If a node is NOT in the hazard list, we delete it.
+   - If it IS in the list, we keep it for next time.
+3. **Global Retirement**: If a thread dies, it pushes its leftovers to a Global Retirement list so they aren't lost.
+
+### Clean Shutdown
+
+Threads are messy. When the program ends, some "trash" nodes might still be waiting to be deleted.
+
+- **Default**: We intentionally "leak" them to the OS. This is safer than trying to delete them while other threads might race to access them during a chaotic shutdown.
+- **Manual Drain**: If you NEED to verify 0 leaks (e.g., in tests), you can call `ms_queue::drain_retired()`. But be careful! **Only do this when all threads are dead.**
+
+---
+
+## 4. The Worker Loop (The Engine)
 
 Each thread runs a loop that looks for work. It has two modes: **Fast Mode** and **Slow Mode**.
 
@@ -72,7 +108,7 @@ If there is work, we just grab it. No locks, no waiting. It's blazing fast âš¡ï¸
 ```cpp
 // Fast path: loop while we can get tasks, without locking.
 while (q_.try_dequeue(task)) {
-  pending_task_count_.fetch_sub(1, std::memory_order_release);
+  pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
   task();
 }
 ```
@@ -80,11 +116,11 @@ while (q_.try_dequeue(task)) {
 ### The Slow Path (Sleeping)
 
 If the queue is empty, we don't want to spin in a circle burning CPU (making your laptop fan go crazy). So we go to sleep.
-We use a `std::condition_variable` to wait. When a new task arrives, we wake up ONE thread.
+We use a separate mutex `cv_mutex_` to avoid blocking submitters while workers sleep.
 
 ---
 
-## 4. Type Erasure (The Universal Box)
+## 5. Type Erasure (The Universal Box)
 
 The queue stores `std::function<void()>`. This is a "Type Erased" container.
 It means it can hold *any* function:

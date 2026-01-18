@@ -40,4 +40,10 @@ run_compute: $(COMPUTE_TARGET)
 run_stress: $(STRESS_TEST)
 	./$(STRESS_TEST)
 
-.PHONY: all clean run run_stress run_compute
+run_queue: $(BIN_DIR)/test_mpmc_queue
+	./$(BIN_DIR)/test_mpmc_queue
+
+$(BIN_DIR)/test_mpmc_queue: test/test_mpmc_queue.cpp include/ms_jthread_pool.hpp | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@
+
+.PHONY: all clean run run_stress run_compute run_queue

@@ -48,8 +48,8 @@ struct hazard_domain {
 };
 
 inline hazard_domain& global_hazard_domain() {
-  static hazard_domain hd;
-  return hd;
+  static hazard_domain* hd = new hazard_domain(); // Leaky singleton (immortal)
+  return *hd;
 }
 
 // --------------------------- Michael–Scott MPMC queue ------------------------
@@ -72,7 +72,7 @@ class ms_queue {
 
       ~RetirementManager() {
           // Push remaining retired nodes to global pool on thread exit
-          global_retire_.add(retired_list);
+          global_retire().add(retired_list);
       }
 
       void push(node* n) {
@@ -97,7 +97,7 @@ class ms_queue {
           } 
 
           // Steal from global retirement occasionally (e.g. if we have few local nodes, or always try)
-          global_retire_.steal_to(retired_list);
+          global_retire().steal_to(retired_list);
 
           // Sort snapshot for binary search O(S log S)
           std::sort(snapshot.begin(), snapshot.end());
@@ -150,7 +150,10 @@ class ms_queue {
       }
   };
 
-  static inline GlobalRetirement global_retire_;
+  static GlobalRetirement& global_retire() {
+      static GlobalRetirement* gr = new GlobalRetirement(); // Leaky singleton (immortal)
+      return *gr;
+  }
 
   static RetirementManager& get_retire_manager() {
       static thread_local RetirementManager rm;
@@ -186,7 +189,7 @@ public:
   // Specifically: all thread_local destructors for RetirementManager must have completed.
   // This is typically called at strictly serialized process exit.
   static void drain_retired() {
-      global_retire_.drain();
+      global_retire().drain();
   }
 
   ms_queue() {
@@ -196,11 +199,14 @@ public:
   }
   ~ms_queue() {
     // REQUIREMENT: External synchronization required.
-    // No other threads may access the queue during destruction.
-    // All threads must have returned any hazard slots (hp_owner destroyed) before domain destruction.
-    // (hazard_domain is static so it outlives queue).
+    // In practice, safe reclamation requires all threads' TLS retirement managers to be destroyed.
+    // But since pool destroys queue after joining threads, it is safe to walk and delete.
     node* n = head_.load(std::memory_order_relaxed);
-    while (n) { node* next = n->next.load(std::memory_order_relaxed); delete n; n = next; }
+    while (n) {
+      node* next = n->next.load(std::memory_order_relaxed);
+      delete n;
+      n = next;
+    }
   }
   ms_queue(const ms_queue&) = delete;
   ms_queue& operator=(const ms_queue&) = delete;
@@ -352,7 +358,7 @@ public:
 // --------------------------------- thread pool --------------------------------
 class jthread_pool {
 public:
-  using task_type = std::function<void()>; // needs to be copyable for std::function
+  using task_type = std::function<void()>;
 
   explicit jthread_pool(std::size_t threads = std::thread::hardware_concurrency()) {
     if (threads == 0) threads = 1;
@@ -362,40 +368,57 @@ public:
     }
   }
 
-
   ~jthread_pool() {
     request_stop();
-    cv_.notify_all();     // wake sleepers
-    workers_.clear();     
+    workers_.clear();                 // joins all workers
+    ms_queue<task_type>::drain_retired(); // now safe: no live hazards from workers
   }
 
   jthread_pool(const jthread_pool&) = delete;
   jthread_pool& operator=(const jthread_pool&) = delete;
 
-  void request_stop() noexcept { 
-      stop_.store(true, std::memory_order_release); 
-      cv_.notify_all();
+  // Key fix: serialize stop with submit via submit_mutex_, and keep lock order consistent:
+  // submit_mutex_ -> cv_mutex_
+  void request_stop() noexcept {
+    {
+      std::lock_guard lk(submit_mutex_);
+      std::lock_guard lk2(cv_mutex_);
+      stop_.store(true, std::memory_order_release);
+    }
+    cv_.notify_all();
   }
 
   template <class F, class... Args>
   auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
     using R = std::invoke_result_t<F, Args...>;
 
-    if (stop_.load(std::memory_order_acquire)) 
-      throw std::runtime_error("jthread_pool stopped");
-
-    auto bound = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
+    auto bound   = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
     auto sp_task = std::make_shared<std::packaged_task<R()>>(std::move(bound));
     std::future<R> fut = sp_task->get_future();
+    task_type t = [sp_task]() mutable { (*sp_task)(); };
 
-    task_type t = [sp_task]() mutable { (*sp_task)(); }; // copies shared_ptr
-    
-    pending_task_count_.fetch_add(1, std::memory_order_acq_rel);
-    try {
+    {
+      std::lock_guard lk(submit_mutex_);
+      if (stop_.load(std::memory_order_acquire))
+        throw std::runtime_error("jthread_pool stopped");
+
+      // Publish "pending" BEFORE enqueue to make the CV predicate reliable.
+      // Keep the increment under cv_mutex_ so state changes are coherent with waiters.
+      {
+        std::lock_guard lk2(cv_mutex_);
+        pending_task_count_.fetch_add(1, std::memory_order_release);
+      }
+
+      // Enqueue while still holding submit_mutex_ so request_stop() can't interleave
+      // and cause "stop + workers exit" while a submit sneaks in.
+      try {
         q_.enqueue(std::move(t));
-    } catch (...) {
-        pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
+      } catch (...) {
+        // Rollback pending count if enqueue throws
+        auto prev = pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
+        assert(prev > 0 && "pending_task_count_ underflow on rollback");
         throw;
+      }
     }
 
     cv_.notify_one();
@@ -405,44 +428,60 @@ public:
   std::size_t size() const noexcept { return workers_.size(); }
 
 private:
-  void worker_loop_(std::stop_token st) {
+  void worker_loop_(std::stop_token /*st*/) {
     for (;;) {
       task_type task;
-      // Fast path: loop while we can get tasks, without locking.
+
+      // Drain available tasks without holding cv_mutex_
       while (q_.try_dequeue(task)) {
-        // We consumed a task from the queue.
-        pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
+        auto prev = pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
+        assert(prev > 0 && "pending_task_count_ underflow");
         task();
       }
 
-      if (st.stop_requested() || stop_.load(std::memory_order_acquire)) {
-        // Drain remaing tasks then exit
-        while (q_.try_dequeue(task)) {
-             pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
-             task();
-        }
-        return;
-      }
-
-      // Slow path: no task found, wait for notification.
-      std::unique_lock lk(m_);
-      // Predicate: stop requested OR pending tasks available.
-      // Note: We might wake up and fail to dequeue (some other worker got it), 
-      // but that is handled by the outer loop which retries the inner while(try_dequeue).
-      cv_.wait(lk, st, [this]{ 
-        return stop_.load(std::memory_order_acquire) || 
-               pending_task_count_.load(std::memory_order_acquire) > 0; 
+      // Sleep until there is work or stop
+      std::unique_lock lk(cv_mutex_);
+      cv_.wait(lk, [this]{
+        return stop_.load(std::memory_order_acquire) ||
+               pending_task_count_.load(std::memory_order_acquire) > 0;
       });
+
+      // If stop was requested, drain remaining pending work and exit.
+      if (stop_.load(std::memory_order_acquire)) {
+        lk.unlock();
+
+        // Since submit() is serialized with request_stop() via submit_mutex_,
+        // once stop_ is set, no new pending tasks can be published.
+        for (;;) {
+          // Drain whatever is in the queue
+          while (q_.try_dequeue(task)) {
+            auto prev = pending_task_count_.fetch_sub(1, std::memory_order_acq_rel);
+            assert(prev > 0 && "pending_task_count_ underflow");
+            task();
+          }
+
+          // If all published work is done, exit
+          if (pending_task_count_.load(std::memory_order_acquire) == 0)
+            return;
+
+          // There is published work but queue is momentarily empty (submit published pending
+          // but hasn't enqueued yet, or another worker stole). Yield briefly and retry.
+          std::this_thread::yield();
+        }
+      }
     }
   }
 
   ms_queue<task_type> q_{};
-  
-  std::mutex m_{};
-  std::condition_variable_any cv_{};
+
+  std::condition_variable_any cv_;
+  std::mutex cv_mutex_;       // protects CV protocol coherence (predicate state)
+  std::mutex submit_mutex_;   // serializes submit vs stop and prevents stop/submit races
   std::atomic<bool> stop_{false};
+
+  // "Published" count of tasks expected to be executed (enqueue may lag slightly)
   std::atomic<std::ptrdiff_t> pending_task_count_{0};
-  
+
   std::vector<std::jthread> workers_{};
 };
 
