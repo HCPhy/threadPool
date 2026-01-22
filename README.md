@@ -87,3 +87,5 @@ This is a lock-free implementation designed for education and high performance.
 - **Shutdown**: The pool correctly serializes shutdown with submission. It joins workers and cleans up the queue automatically.
 - **Teardown**: Internal "Leaky Singletons" ensure Global Hazard Pointers survive thread-local destruction, so no crashes at program exit.
 - **Verification**: Run `make run_queue` to verify MPMC correctness under rigorous contention.
+
+> **Note for Standalone Queue Usage**: If you use `ms::ms_queue` directly (without the thread pool), you **must** call `ms::ms_queue<T>::drain_retired()` at the very end of your program (after all threads are joined) to reclaim remaining memory. The `jthread_pool` handles this automatically in its destructor.

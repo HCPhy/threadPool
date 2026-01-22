@@ -31,13 +31,14 @@ This is the most confusing part of C++. We use `std::memory_order_...` everywher
 
 ### `std::memory_order_relaxed`
 
-**"The Post-it Note"**
+#### "The Post-it Note"
+
 I'm writing a note to myself. It doesn't matter if you see it now or in 5 minutes.
 *Used for:* Incrementing counters, statistics.
 
 ### `std::memory_order_release` & `std::memory_order_acquire`
 
-**"The Package Delivery"**
+#### "The Package Delivery"
 
 - **Release (Sending)**: I pack a box with data, tape it shut, and hand it to the driver. nothing I put *inside* the box can fall out.
 - **Acquire (Receiving)**: You get the box and open it. You are guaranteed to see everything I put in there.
@@ -84,6 +85,26 @@ Threads are messy. When the program ends, we need to be careful about destructio
     - *Why?* To prevent "Use-After-Destruct" bugs where a thread tries to retire a node after the global manager has already been destroyed at program exit.
 2. **Automatic Cleanup**: The Pool destructor joins all threads first. Once all threads are stopped, we know no one is using the queue.
     - Then we safely walk the queue and delete all remaining nodes. No leaks!
+
+### Advanced: `drain_retired()` and Global Quiescence
+
+If you use `ms_queue` *outside* of `jthread_pool`, you face a challenge: safely cleaning up the "Global Retirement" list at the end of the program.
+
+We provide a static method `ms_queue<T>::drain_retired()`.
+
+> **⚠️ WARNING:** This function is dangerous.
+> It deletes **ALL** nodes in the global retirement list.
+> You must only call this when **Strict Global Quiescence** is met:
+>
+> 1. All threads that ever accessed the queue have been joined/destroyed.
+> 2. No thread is currently accessing the queue.
+> 3. No thread-local `RetirementManager` destructors are pending (i.e., all worker threads have fully exited).
+
+The `jthread_pool` destructor guarantees this sequence:
+
+1. `request_stop()` signals threads to exit.
+2. `workers_.clear()` joins all `jthread`s. This ensures all worker loops are done and their thread-local destructors (which flush to global retirement) have run.
+3. Finally, it calls `drain_retired()`.
 
 ---
 
