@@ -1,91 +1,68 @@
-# Educational Lock-Free Thread Pool (Beginner Friendly!)
+# Lock-Free C++20 Thread Pool
 
-Welcome! 👋
+A high-performance, header-only thread pool implementation demonstrating modern C++ concurrency patterns. It features a lock-free Michael-Scott MPMC queue, Hazard Pointer memory reclamation, and C++20 thread management.
 
-Concurrency is hard. Locks are slow. Thread pools are confusing.
-This project is a **safe space** to learn how modern, high-performance C++ thread pools work under the hood.
+> **Status**: Experimental / Educational.
+> Verified with ThreadSanitizer (TSan) and AddressSanitizer (ASan).
 
-We use **C++20**, **Lock-Free Queues**, and **Hazard Pointers**, but we explain it all in plain English.
+## Key Features
 
-> **Status**: Hardened & Verified.
-> This implementation includes a robust Lock-Free MPMC Queue, Hazard Pointer memory reclamation, and correct "Event Count" notification logic to prevent lost wakeups and shutdowns races.
+* **Lock-Free Queue**: Michael-Scott MPMC algorithm for non-blocking task submission.
+* **Hazard Pointers**: Robust Safe Memory Reclamation (SMR) solving the ABA problem without locks.
+* **C++20 Integration**: Utilizes `std::jthread` for automatic joining and `std::stop_token` for cooperative cancellation.
+* **Event Count Synchronization**: Optimizes the sleep/wake cycle to prevent lost wakeups and minimize syscall overhead.
+* **Exception Safe**: RAII wrappers ensure hazard slots are always returned, even on thread panic.
 
----
+## Architecture Overview
 
-## 📚 Read the "For Idiots" Docs
+| Component       | Implementation                | Notes                                            |
+| --------------- | ----------------------------- | ------------------------------------------------ |
+| **Queue**       | Michael-Scott                 | Linearizable, Non-blocking.                      |
+| **Reclamation** | Hazard Pointers               | Scan threshold = 64. Binary search optimization. |
+| **Threads**     | `std::jthread`                | Auto-joining.                                    |
+| **Signaling**   | `std::condition_variable_any` | Uses `wake_seq` (Event Count) logic.             |
 
-We have written special documentation just for you. No PhD required.
+## Documentation
 
-### 1. [The Theory (start here)](docs/algorithms.md)
+* **[Algorithms Explained](docs/algorithms.md)**: Deep dive into the correctness of the Michael-Scott queue and Hazard Pointer logic.
+* **[Implementation Details](docs/implementation_details.md)**: C++ memory ordering choices (`acquire`/`release`), Type erasure, and Singleton lifecycles.
+* **[Performance Analysis](docs/performance_analysis.md)**: Benchmarks against OpenMP and Serial baselines.
 
-Learn about:
+## Quick Start
 
-- **Lock-Free vs Locking** (The polite buffet vs the bathroom key)
-- **The Queue** (How we push/pop without locks)
-- **The ABA Problem** (Why bad things happen to good threads)
-- **Hazard Pointers** (How we solve the ABA problem without locks)
+### Requirements
 
-### 2. [The Code](docs/implementation_details.md)
+* C++20 compliant compiler (GCC 10+, Clang 11+, MSVC 19.28+)
+* Pthreads (on Linux/Mac)
 
-Learn about:
-
-- **`std::jthread`** (The self-cleaning thread)
-- **Event Counts** (How we wake threads without races)
-- **The Worker Loop** (How threads find work efficiently)
-- **Memory Reclamation** (How we clean up trash safely)
-
----
-
-## 🚀 Quick Start
-
-Want to see it run? Copy-paste this into your terminal:
-
-```bash
-# Compile (You need a modern C++ compiler like g++ 10 or clang 10)
-make run_stress
-
-# Run performance benchmark
-make run_compute
-```
-
-### Code Example
-
-Using the pool is super simple:
+### Usage
 
 ```cpp
 #include "ms_jthread_pool.hpp"
 #include <iostream>
 
 int main() {
-    // 1. Create a pool with 4 workers
-    ms::jthread_pool pool(4);
+    // 1. Initialize pool with hardware concurrency
+    ms::jthread_pool pool;
 
-    // 2. Give it a job (Fire and forget)
+    // 2. Submit a fire-and-forget task
     pool.submit([]{ 
-        std::cout << "Hello from a worker thread!\n"; 
+        std::cout << "Task executing on " << std::this_thread::get_id() << "\n"; 
     });
 
-    // 3. Give it a job and wait for the result
-    auto future = pool.submit([](int x) { 
-        return x * x; 
-    }, 10);
+    // 3. Submit a task with a return value (Future)
+    auto future = pool.submit([](int a, int b) { 
+        return a + b; 
+    }, 10, 20);
 
-    std::cout << "Result: " << future.get() << "\n"; // Prints 100
+    std::cout << "Result: " << future.get() << "\n"; // Blocks until ready
+    
+    // Pool destructor automatically joins threads and reclaims memory.
 }
-```
+Build & Test
+Bash
+# Build the stress test (High contention verification)
+make run_stress
 
-## 📁 What's Inside?
-
-- `include/ms_jthread_pool.hpp`: **The Whole Enchilada**. The entire library is in this one file.
-- `test/stress_test.cpp`: Proof that it handles heavy load.
-- `docs/`: The friendly documentation.
-
-## ⚠️ Safety Notes
-
-This is a lock-free implementation designed for education and high performance.
-
-- **Shutdown**: The pool correctly serializes shutdown with submission. It joins workers and cleans up the queue automatically.
-- **Teardown**: Internal "Leaky Singletons" ensure Global Hazard Pointers survive thread-local destruction, so no crashes at program exit.
-- **Verification**: Run `make run_queue` to verify MPMC correctness under rigorous contention.
-
-> **Note for Standalone Queue Usage**: If you use `ms::ms_queue` directly (without the thread pool), you **must** call `ms::ms_queue<T>::drain_retired()` at the very end of your program (after all threads are joined) to reclaim remaining memory. The `jthread_pool` handles this automatically in its destructor.
+# Run compute benchmarks
+make run_compute

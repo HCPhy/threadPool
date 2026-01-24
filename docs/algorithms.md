@@ -1,97 +1,67 @@
-# Algorithms Explained (For Normal Humans)
+# Algorithms & Theoretical Basis
 
-This document explains the magic behind the **Lock-Free Thread Pool**. We use some fancy computer science terms, but don't worry—we'll explain them using real-world analogies.
+This document details the non-blocking synchronization algorithms used in `ms_jthread_pool`. It assumes familiarity with basic concurrency concepts (threads, atomics) and focuses on the specific lock-free mechanisms employed.
 
----
+## 1. Michael-Scott MPMC Queue
 
-## 1. What is "Lock-Free"?
+The core data structure is a **Lock-Free Multiple-Producer Multiple-Consumer (MPMC) Queue**, based on the classic algorithm by Michael and Scott (1996).
 
-Imagine a single bathroom with one key. Only one person can use it at a time. Everyone else has to wait in line. This is **Locking**. It's safe, but slow.
+### Structure
 
-**Lock-Free** is like a buffet. Everyone grabs food at the same time. There are no locks, but you have to be polite and follow some rules so you don't bump into each other or grab the same spoon at the exact same moment.
+The queue is a linked list of nodes.
 
-### The Secret Weapon: Compare-And-Swap (CAS)
+* **Invariants:** The queue always contains at least one node (a sentinel/dummy node).
+* **Head Pointer:** Points to the beginning of the list (or the dummy node).
+* **Tail Pointer:** Points to the last node (or close to it).
 
-In C++, this is simplified as `compare_exchange`. Think of it like **booking a specific seat at a movie theater online**.
+### The "Helping" Mechanism
 
-1. **Read (Look)**: You look at the map and see Seat A1 is green (available).
-2. **Decide**: "I want Seat A1."
-3. **CAS (Click "Buy")**: You try to pay for it.
-    * **Success**: Nobody else bought it in the last 5 seconds. It's yours!
-    * **Failure**: Someone else was faster and bought it while you were getting your credit card. The map refreshes, and now A1 is red. You have to pick a new seat and try again.
+A defining feature of this algorithm is cooperative concurrency.
 
-We use this logic for *everything* in this thread pool. We don't stop the world; we just try to update a value, and if someone beat us to it, we retry.
+1. **Enqueue:** When a thread tries to add a node, it first checks if the `Tail` is pointing to the actual last node.
+2. If the `Tail`'s `next` pointer is *not* null, it means another thread successfully linked a new node but fell asleep before updating the `Tail`.
+3. **Helping:** The current thread will use a CAS (Compare-And-Swap) to push the `Tail` forward on behalf of the sleeping thread *before* attempting its own operation. This ensures the queue never blocks even if a thread stalls mid-operation.
 
----
+### Consistency
 
-## 2. The Queue (Michael-Scott)
+The queue is **Linearizable**.
 
-This is where we store the tasks (functions) that the threads need to run. It's a "Multiple-Producer Multiple-Consumer" (MPMC) queue, meaning lots of people can add tasks and lots of people can remove tasks at the same time.
-
-It has two main pointers:
-
-* **Head**: Where we take tasks from.
-
-* **Tail**: Where we add new tasks.
-
-```mermaid
-graph LR
-    H[Head] --> Dummy[Dummy Node]
-    Dummy --> Node1[Task 1]
-    Node1 --> Node2[Task 2]
-    T[Tail] --> Node2
-    Node2 --> null
-```
-
-### Adding a Task (Enqueue)
-
-1. Create a new node with your task.
-2. Look at the `Tail`.
-3. Try to stick your new node onto the end of the `Tail`.
-    * **Use CAS**: "Is the `next` pointer of the Tail still `null`? If so, point it to MY node."
-4. If it works, swing the `Tail` pointer to point to your new node. You're done!
-
-### Removing a Task (Dequeue)
-
-1. Look at the `Head`.
-2. Is there a node after the `Head`?
-3. Try to move the `Head` forward one step.
-    * **Use CAS**: "Is the `Head` still pointing to this node? If so, move it to the `next` node."
-4. If it works, you take the value from that node and run it.
+* **Enqueue point:** The successful CAS on the `next` pointer of the last node.
+* **Dequeue point:** The successful CAS on the `head` pointer.
 
 ---
 
-## 3. The "ABA" Problem (The Scariest Bug)
+## 2. The ABA Problem
 
-This is the classic nightmare of lock-free programming.
+Lock-free algorithms relying on pointers face the **ABA Problem**:
 
-### The Analogy: The Recycled Box
+1. Thread T1 reads pointer `A` from the stack.
+2. Thread T2 pops `A`, frees it, allocates a new node at address `A` (recycling the memory), and pushes it back.
+3. Thread T1 attempts a CAS assuming the state hasn't changed because the pointer address is still `A`.
+4. **Result:** Corruption. The logical identity of the node changed, but the physical address did not.
 
-1. **Thread 1** looks at a box labeled **"A"**. It's full of cookies. Thread 1 pauses to tie its shoe.
-2. **Thread 2** comes in, eats the cookies, throws usage box **"A"** in the trash.
-3. **Thread 3** comes in, recycles the trash, makes a NEW box, and coincidentally labels it **"A"** again. It puts broccoli in it.
-4. **Thread 1** finishes tying its shoe. It looks back. It sees a box labeled **"A"**. It thinks, "Aha! This is the same box of cookies I saw earlier!" and eats... **BROCCOLI**. 🤮
-
-In C++, this happens when a memory address is freed and then re-allocated. The address (pointer) looks the same, but the object is totally different. The CAS operation gets tricked because the value *looks* correct (it matches "A"), but reality has changed.
+To solve this, we cannot rely on standard `delete`. We must ensure memory remains valid as long as *any* thread holds a reference to it.
 
 ---
 
-## 4. Hazard Pointers (The Solution)
+## 3. Hazard Pointers (Memory Reclamation)
 
-How do we stop eating broccoli? We use **Hazard Pointers**.
+We implement a **Hazard Pointer (HP)** scheme to guarantee safe memory reclamation (SMR). This provides wait-free readers and lock-free reclamation.
 
-### The Analogy: The Reservation Sign
+### The Protocol
 
-Before **Thread 1** touches *anything* (even before it looks inside the box), it puts up a big neon sign that says:
+1. **Publish:** Before a thread accesses a node (e.g., dereferencing `head` or `tail`), it "publishes" the pointer into a global `hazard_domain` array visible to all threads.
+2. **Validate:** After publishing, the thread *re-reads* the global pointer. If it has changed, the hazard pointer is cleared, and the operation retries. This ensures we are protecting a node that is arguably still part of the data structure.
+3. **Retire:** When a node is removed from the queue, it is not deleted. It is placed in a **Thread-Local Retirement List**.
 
-> **"I AM LOOKING AT BOX 'A'. DO NOT THROW IT AWAY."**
+### The Scan Algorithm (Reclamation)
 
-This is the **Hazard Pointer**. It's a global list that everyone can see.
+When a thread's local retirement list reaches a threshold (e.g., 64 nodes), it performs a scan to free memory:
 
-When **Thread 2** wants to throw away box "A", it **MUST** check the signs first.
+1. **Snapshot:** The thread reads all active Hazard Pointers from the global domain into a local vector.
+2. **Sort:** The snapshot is sorted ($O(H \log H)$, where $H$ is the number of hazards).
+3. **Search:** The thread iterates through its retirement list. For each candidate node, it performs a binary search ($O(\log H)$) against the snapshot.
+    * **Found:** The node is currently in use. Keep it in the list.
+    * **Not Found:** No thread is reading this node. It is safe to `delete`.
 
-* If it sees Thread 1's sign on "A", it **cannot** throw it away. It puts "A" in a "To Be Deleted Later" pile.
-
-* Later, once Thread 1 is done and takes down its sign, Thread 2 converts the trash.
-
-This guarantees that as long as you are looking at an object, it cannot be deleted or reused effectively preventing the ABA problem. No broccoli for you!
+This approach guarantees that no memory is freed while a thread holds a reference to it, effectively solving the ABA problem without heavy locks or reference counting.

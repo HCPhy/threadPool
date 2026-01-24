@@ -28,13 +28,13 @@ This document summarizes the performance characteristics of `ms::jthread_pool` c
 
 ### 1. Small Workloads (1K - 5K Items)
 
-**Winner: Thread Pool**
+#### Winner: Thread Pool
 
 - **Reason:** Lower latency and startup overhead. OpenMP creates/initializes a parallel region which has a fixed cost. The thread pool has worker threads already spinning or waiting on a condition variable, allowing for faster dispatch of small tasks.
 
 ### 2. Large Workloads (25K+ Items)
 
-**Winner: OpenMP (Slightly)**
+#### Winner: OpenMP (Slightly)
 
 - **Reason:**
   - **Optimization:** OpenMP is compiler-integrated and can perform better loop optimizations and vectorization.

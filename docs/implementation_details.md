@@ -1,167 +1,71 @@
-# Implementation Details (The Nuts and Bolts)
+# Implementation Details
 
-This document connects the high-level theories to the actual C++ code you see in `include/ms_jthread_pool.hpp`.
+This document bridges the gap between the algorithms and the C++20 implementation in `include/ms_jthread_pool.hpp`.
 
---
+## 1. Memory Model & Ordering
 
-## 1. C++20 Cool Tools
+We utilize C++11 memory model semantics to ensure correctness while minimizing hardware fence overhead.
 
-We use modern C++20 features to make life easier.
+### Acquire-Release Semantics
 
-### `std::jthread` (The Auto-Joiner)
+We strictly avoid `std::memory_order_seq_cst` (Sequentially Consistent) due to its high cost on non-x86 architectures (e.g., ARM/Apple Silicon).
 
-In older C++, `std::thread` is like a leaky faucet. If you forget to turn it off (call `.join()`), your program crashes.
-`std::jthread` is a "Joining Thread". When it goes out of scope, it **automatically** cleans itself up. It's safe by default.
+* **Producing (Store)**: Used when updating pointers (e.g., `tail_.store(...)`). We use `std::memory_order_release`. This ensures that any writes to the node's payload happen-before the pointer becomes visible to other threads.
+* **Consuming (Load)**: Used when reading pointers (e.g., `head_.load(...)`). We use `std::memory_order_acquire`. This ensures we see the data written by the releasing thread.
 
-### `std::stop_token` (The Polite Stop Button)
+### The Hazard Pointer Handshake
 
-How do you kill a thread?
+Hazard pointers require a specific ordering to guarantee safety:
 
-- **The Old Way**: `pthread_kill` (shooting it in the head). Dangerous.
-- **The Bad Way**: A global boolean flag `bool running = true`. Messy.
-- **The C++20 Way**: `std::stop_token`.
-
-Is a standard way to say "Hey, please finish up what you're doing and exit." inside the thread loop, checking `st.stop_requested()`.
+1. **Store HP (Release)**: `hp_slot.store(ptr, std::memory_order_release)` ensures the protection is visible before we check the validity.
+2. **Check Ptr (Acquire)**: `ptr.load(std::memory_order_acquire)` ensures we re-validate against the latest global state.
 
 ---
 
-## 2. Memory Ordering (The Brainless Stuff)
+## 2. Hazard Domain Architecture
 
-This is the most confusing part of C++. We use `std::memory_order_...` everywhere. Here is the translation:
+The `hazard_domain` is a singleton managing the pool of reservation slots.
 
-### `std::memory_order_relaxed`
-
-#### "The Post-it Note"
-
-I'm writing a note to myself. It doesn't matter if you see it now or in 5 minutes.
-*Used for:* Incrementing counters, statistics.
-
-### `std::memory_order_release` & `std::memory_order_acquire`
-
-#### "The Package Delivery"
-
-- **Release (Sending)**: I pack a box with data, tape it shut, and hand it to the driver. nothing I put *inside* the box can fall out.
-- **Acquire (Receiving)**: You get the box and open it. You are guaranteed to see everything I put in there.
-
-We use this for the Queue and Hazard Pointers.
-
-1. **Producer**: Writes the data, then uses `Release` to update the `Tail` pointer.
-2. **Consumer**: Uses `Acquire` to read the `Head` pointer. This guarantees they see the data the producer wrote.
-3. **Hazards**: We use `acc_rel` (Acquire-Release) to ensure published hazard pointers are visible to everyone instantly.
+* **Slot Allocation**: We use a `std::stack<unsigned>` protected by a `std::mutex` to manage free slot indices.
+  * *Note*: While the queue operations are lock-free, *acquiring* a hazard slot technically involves a lock. However, slots are cached in Thread Local Storage (TLS) via the `hp_owner` struct, so this lock is hit only once per thread creation, effectively making the hot-path lock-free.
+* **Leaky Singleton**: The global `hazard_domain` is allocated via `new` and never deleted.
+  * *Reason*: To prevent the **Static Deinitialization Order Fiasco**. If a worker thread (managed by a static pool) tries to access the hazard domain during program exit after the domain has been destroyed, a segfault occurs. Leaking the domain ensures it survives until the OS reclaims process memory.
 
 ---
 
-## 3. Hazard Pointers & Reclamation (The Safety Net)
+## 3. The Thread Pool Engine
 
-We implemented a custom, lightweight Hazard Pointer system.
+The `jthread_pool` builds upon the queue to provide task scheduling.
 
-### The `hp_owner` (RAII)
+### The "Fast-Path/Slow-Path" Loop
 
-Instead of manually managing slots, we use a C++ idiom called **RAII** (Resource Acquisition Is Initialization).
-When a thread wants to touch the queue, it creates an `hp_owner` object.
+The worker loop is designed to minimize latency:
 
-- **Constructor**: Automatically borrows 2 slots from the global `hazard_domain`.
-- **Destructor**: Automatically returns them when the thread leaves the function.
+1. **Fast Path (Spin/Poll)**: The worker loops purely on `q_.try_dequeue()`. If tasks are available, it executes them immediately without touching mutexes or condition variables.
+2. **Slow Path (Wait)**: If the queue is empty, the thread checks the **Event Count** (`wake_seq_`) and waits on `std::condition_variable`.
 
-This guarantees we never "leak" slots, even if an exception is thrown!
+### Event Count Optimization
 
-### The Retirement Strategy
+To avoid the "Lost Wakeup" problem (where a notification is sent *after* a thread checks empty but *before* it sleeps):
 
-When we delete a node, we can't just `delete` it (someone might be looking at it).
+* **Sequence Number**: We maintain a monotonic atomic counter `wake_seq_`.
+* **Snapshot**: The worker snapshots `wake_seq_` *before* checking the queue.
+* **Predicate**: The condition variable wait includes a check: `current_seq != snapshot`.
+* This guarantees that if a task was added while the thread was transitioning to sleep, the sequence number mismatch will prevent the thread from sleeping.
 
-1. **Thread-Local Stash**: Each thread keeps a small list of "trash" nodes.
-2. **Scan**: When the stash gets full (64 items), we scan the global Hazard Pointers.
-   - We take a snapshot of all active hazards.
-   - We sort them (fast search!).
-   - If a node is NOT in the hazard list, we delete it.
-   - If it IS in the list, we keep it for next time.
-3. **Global Retirement**: If a thread dies, it pushes its leftovers to a Global Retirement list so they aren't lost.
+### Type Erasure
 
-### Clean Shutdown
+We use `std::function<void()>` for tasks.
 
-Threads are messy. When the program ends, we need to be careful about destruction order.
-
-1. **Leaky Singletons**: We use "Immortal" global objects for the Hazard Domain. They are allocated with `new` and never `delete`d.
-    - *Why?* To prevent "Use-After-Destruct" bugs where a thread tries to retire a node after the global manager has already been destroyed at program exit.
-2. **Automatic Cleanup**: The Pool destructor joins all threads first. Once all threads are stopped, we know no one is using the queue.
-    - Then we safely walk the queue and delete all remaining nodes. No leaks!
-
-### Advanced: `drain_retired()` and Global Quiescence
-
-If you use `ms_queue` *outside* of `jthread_pool`, you face a challenge: safely cleaning up the "Global Retirement" list at the end of the program.
-
-We provide a static method `ms_queue<T>::drain_retired()`.
-
-> **⚠️ WARNING:** This function is dangerous.
-> It deletes **ALL** nodes in the global retirement list.
-> You must only call this when **Strict Global Quiescence** is met:
->
-> 1. All threads that ever accessed the queue have been joined/destroyed.
-> 2. No thread is currently accessing the queue.
-> 3. No thread-local `RetirementManager` destructors are pending (i.e., all worker threads have fully exited).
-
-The `jthread_pool` destructor guarantees this sequence:
-
-1. `request_stop()` signals threads to exit.
-2. `workers_.clear()` joins all `jthread`s. This ensures all worker loops are done and their thread-local destructors (which flush to global retirement) have run.
-3. Finally, it calls `drain_retired()`.
+* **Issue**: `std::packaged_task` (used for `std::future`) is move-only, but `std::function` requires copy-constructibility.
+* **Solution**: We wrap the `packaged_task` in a `std::shared_ptr`. The `shared_ptr` is copyable, satisfying `std::function`, while the underlying task remains unique and shared.
 
 ---
 
-## 4. The Worker Loop (The Engine)
+## 4. Lifecycle & Safety
 
-Each thread runs a loop that looks for work. It has two modes: **Fast Mode** and **Slow Mode**.
+### Safe Shutdown
 
-```mermaid
-graph TD
-    Start[Start Loop] --> CheckQ{Try Dequeue}
-    CheckQ -- Success --> Execute[Run Task]
-    Execute --> Start
-    CheckQ -- Fail --> SlowPath[Slow Path: Check Event Count]
-    SlowPath --> Wait[Wait on Condition Variable]
-    Wait --> WakeUp[Woken Up!]
-    WakeUp --> Start
-```
-
-### The Fast Path (Lock-Free)
-
-If there is work, we just grab it. No locks, no waiting. It's blazing fast ⚡️.
-
-```cpp
-// Fast path: loop while we can get tasks, without locking.
-while (q_.try_dequeue(task)) {
-  task(); // Just do it!
-}
-```
-
-### The Slow Path (Event Counts)
-
-If the queue is empty, we don't want to spin. But checking `empty()` and then sleeping is race-prone (the "lost wakeup" problem).
-
-We use a monotonic **Event Count** (`wake_seq_`):
-
-1. **Submitter**: Enqueues task -> Increments `wake_seq_` -> Notifies.
-2. **Worker**: Memorizes `wake_seq_` -> Tries Dequeue -> If empty, Sleeps *only if* `wake_seq_` hasn't changed.
-
-This guarantees we never go to sleep after a task has arrived.
-
----
-
-## 5. Type Erasure (The Universal Box)
-
-The queue stores `std::function<void()>`. This is a "Type Erased" container.
-It means it can hold *any* function:
-
-- A function pointer `void foo()`
-- A lambda `[]{ std::cout << "Hi"; }`
-- A method on a class object.
-
-However, `std::function` needs the task to be **Copyable**.
-`std::packaged_task` (which gives us the return value `future`) is **NOT Copyable**.
-
-**The Hack:**
-We wrap the task in a `std::shared_ptr`.
-
-- The `shared_ptr` itself is copyable (it's just a small pointer).
-- So `std::function` is happy copying the pointer.
-- Both copies point to the same task. Success!
+1. **Stop Token**: We use `std::stop_token` (C++20). The worker loop checks `st.stop_requested()` periodically.
+2. **Join**: The `std::jthread` destructor automatically joins.
+3. **Drain**: The pool destructor ensures `ms_queue::drain_retired()` is called. This forces the deletion of any nodes lingering in the global retirement list, ensuring zero memory leaks (verified by Valgrind/ASAN).
