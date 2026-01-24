@@ -43,6 +43,16 @@ run_stress: $(STRESS_TEST)
 run_queue: $(BIN_DIR)/test_mpmc_queue
 	./$(BIN_DIR)/test_mpmc_queue
 
+# --- Sanitizers ---
+
+debug_tsan: test/stress_test.cpp include/ms_jthread_pool.hpp | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) -g -fsanitize=thread $(INCLUDES) $< -o $(BIN_DIR)/stress_test_tsan
+	./$(BIN_DIR)/stress_test_tsan
+
+debug_asan: test/stress_test.cpp include/ms_jthread_pool.hpp | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) -g -fsanitize=address $(INCLUDES) $< -o $(BIN_DIR)/stress_test_asan
+	./$(BIN_DIR)/stress_test_asan
+
 $(BIN_DIR)/test_mpmc_queue: test/test_mpmc_queue.cpp include/ms_jthread_pool.hpp | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@
 
